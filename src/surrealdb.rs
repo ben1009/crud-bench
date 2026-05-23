@@ -77,7 +77,7 @@ fn surreal_to_bench_value(v: Value) -> BenchValue {
 		}
 		Value::Object(o) => {
 			let mut out: Vec<(String, BenchValue)> = Vec::new();
-			for (k, v) in o.into_inner() {
+			for (k, v) in o {
 				out.push((k, surreal_to_bench_value(v)));
 			}
 			BenchValue::Object(out)
