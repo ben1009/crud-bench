@@ -162,6 +162,14 @@ cargo run -r -- --help
 
 Open [`compare/index.html`](compare/index.html) locally (drag and drop benchmark JSON artefacts). Rows and labels match CLI/CSV ordering from [`src/result.rs`](src/result.rs). Nothing is uploaded; ApexCharts loads from jsDelivr (works offline only if that script is cached or vendored beside the HTML file).
 
+If you only want the Fjall vs ToyKV comparison path, build without default features and enable just those two backends:
+
+```bash
+cargo run --no-default-features --features fjall,toykv -- -d fjall -s 100000 -c 12 -t 24 -r
+```
+
+That compare build does not need `sqlite` or `rocksdb`.
+
 Workload shape (document template, scan cases, and batch throughput tests) is defined in a single TOML file. Use
 `--config <PATH>` or the environment variable `CRUD_BENCH_CONFIG` (default: `config/bench.toml`).
 
