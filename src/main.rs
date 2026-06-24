@@ -30,7 +30,6 @@ mod keyprovider;
 mod memory;
 mod profiling;
 mod result;
-mod storage;
 mod system;
 mod terminal;
 mod util;
@@ -58,11 +57,15 @@ mod rocksdb;
 mod scylladb;
 mod slatedb;
 mod sqlite;
+#[cfg(feature = "surrealdb")]
+mod storage;
+#[cfg(feature = "surrealdb")]
 mod surrealdb;
 mod surrealdb2;
 mod surrealds;
 mod surrealkv;
 mod surrealmx;
+mod toykv;
 
 /// Command-line interface for a single benchmark run.
 #[derive(Parser, Debug)]
@@ -163,6 +166,14 @@ pub(crate) struct Args {
 	/// Skip all batch benchmarks
 	#[arg(long, default_value = "false")]
 	pub(crate) skip_batches: bool,
+
+	/// Skip the delete phase (preserve data for subsequent read-only runs)
+	#[arg(long, default_value = "false")]
+	pub(crate) skip_deletes: bool,
+
+	/// Skip write phases (create, update, delete, batch create/update/delete) — read-only benchmark
+	#[arg(long, default_value = "false")]
+	pub(crate) skip_writes: bool,
 
 	/// Skip index operations, but still table scan queries
 	#[arg(long, default_value = "false")]
@@ -829,16 +840,23 @@ fn run(args: Args) -> Result<()> {
 			res.to_html_charts(&result_html_name, &name)?;
 			println!("📊 Interactive charts saved to: {}", result_html_name);
 
-			// Store results in SurrealDB if requested
+			// Store results in SurrealDB if requested and available in this build.
 			if args.store_results {
-				match runtime.block_on(async {
-					let client = storage::StorageClient::connect(&args.storage_endpoint).await?;
-					client.store_result(&res).await
-				}) {
-					Ok(_) => {
-						println!("💾 Results stored in SurrealDB at: {}", args.storage_endpoint)
+				#[cfg(feature = "surrealdb")]
+				{
+					match runtime.block_on(async {
+						let client = storage::StorageClient::connect(&args.storage_endpoint).await?;
+						client.store_result(&res).await
+					}) {
+						Ok(_) => {
+							println!("💾 Results stored in SurrealDB at: {}", args.storage_endpoint)
+						}
+						Err(e) => eprintln!("⚠️ Failed to store results in SurrealDB: {e}"),
 					}
-					Err(e) => eprintln!("⚠️ Failed to store results in SurrealDB: {e}"),
+				}
+				#[cfg(not(feature = "surrealdb"))]
+				{
+					eprintln!("⚠️ Result storage requires the `surrealdb` feature");
 				}
 			}
 
