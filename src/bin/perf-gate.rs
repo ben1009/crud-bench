@@ -193,10 +193,10 @@ fn parse_duration_ms(cell: &str) -> Result<f64> {
 	if trimmed == "-" {
 		return Ok(0.0);
 	}
-	let Some(value) = trimmed.strip_suffix(" ms") else {
+	let Some(value) = trimmed.strip_suffix("ms") else {
 		bail!("expected duration in ms, got {cell:?}");
 	};
-	parse_number(value, "duration")
+	parse_number(value.trim(), "duration")
 }
 
 fn row_alias(label: &str) -> String {
@@ -347,6 +347,12 @@ fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<Evaluation> {
 }
 
 fn validate_config(cfg: &GateConfig) -> Result<()> {
+	if cfg.max_sync_regression_pct < 0.0 {
+		bail!("--max-sync-regression-pct cannot be negative");
+	}
+	if cfg.max_latency_regression_pct < 0.0 {
+		bail!("--max-latency-regression-pct cannot be negative");
+	}
 	if cfg.min_ratio_improvements > cfg.ratio_rows.len() {
 		bail!(
 			"--min-ratio-improvements ({}) cannot be greater than the number of ratio rows ({})",
@@ -429,6 +435,13 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 		assert_eq!(required_row(&rows, "put_c", "test").unwrap().p95_ms, 0.0);
 		assert_eq!(required_row(&rows, "put_c", "test").unwrap().p99_ms, 0.0);
+	}
+
+	#[test]
+	fn parses_duration_with_variable_spacing() {
+		assert_eq!(parse_duration_ms("1.25ms").unwrap(), 1.25);
+		assert_eq!(parse_duration_ms("1.25 ms").unwrap(), 1.25);
+		assert_eq!(parse_duration_ms("1.25   ms").unwrap(), 1.25);
 	}
 
 	#[test]
@@ -573,6 +586,26 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 		let err = validate_config(&cfg).expect_err("config fails");
 
 		assert!(err.to_string().contains("cannot be greater than the number of ratio rows"));
+	}
+
+	#[test]
+	fn rejects_negative_regression_thresholds() {
+		let mut cfg = GateConfig {
+			rows: vec!["put_c".into()],
+			ratio_rows: vec!["put_c".into()],
+			max_sync_regression_pct: -1.0,
+			min_ratio_improvements: 0,
+			max_latency_regression_pct: 5.0,
+		};
+
+		let err = validate_config(&cfg).expect_err("negative sync threshold fails");
+		assert!(err.to_string().contains("--max-sync-regression-pct cannot be negative"));
+
+		cfg.max_sync_regression_pct = 5.0;
+		cfg.max_latency_regression_pct = -1.0;
+
+		let err = validate_config(&cfg).expect_err("negative latency threshold fails");
+		assert!(err.to_string().contains("--max-latency-regression-pct cannot be negative"));
 	}
 
 	#[test]
