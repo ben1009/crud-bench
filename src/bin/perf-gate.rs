@@ -30,10 +30,10 @@ struct Args {
 	#[arg(long)]
 	fjall_sync: Option<PathBuf>,
 	/// Previous single-client ToyKV --sync CSV for latency checks.
-	#[arg(long)]
+	#[arg(long, requires = "current_latency_sync")]
 	baseline_latency_sync: Option<PathBuf>,
 	/// Current single-client ToyKV --sync CSV for latency checks.
-	#[arg(long)]
+	#[arg(long, requires = "baseline_latency_sync")]
 	current_latency_sync: Option<PathBuf>,
 	/// Rows to gate. Uses stable aliases such as put_c and batch_create_1000.
 	#[arg(long = "row")]
@@ -80,6 +80,11 @@ struct GateInputs {
 	current_latency_sync: Option<BenchCsv>,
 }
 
+struct Evaluation {
+	report: String,
+	passed: bool,
+}
+
 type BenchCsv = HashMap<String, BenchRow>;
 
 fn main() -> Result<()> {
@@ -120,8 +125,11 @@ fn main() -> Result<()> {
 			.transpose()?,
 	};
 
-	let report = evaluate(&cfg, &inputs)?;
-	print!("{report}");
+	let eval = evaluate(&cfg, &inputs)?;
+	print!("{}", eval.report);
+	if !eval.passed {
+		std::process::exit(1);
+	}
 	Ok(())
 }
 
@@ -175,6 +183,9 @@ fn parse_number(cell: &str, label: &str) -> Result<f64> {
 
 fn parse_duration_ms(cell: &str) -> Result<f64> {
 	let trimmed = cell.trim();
+	if trimmed == "-" {
+		return Ok(0.0);
+	}
 	let Some(value) = trimmed.strip_suffix(" ms") else {
 		bail!("expected duration in ms, got {cell:?}");
 	};
@@ -202,7 +213,7 @@ fn row_alias(label: &str) -> String {
 	label.to_string()
 }
 
-fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<String> {
+fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<Evaluation> {
 	validate_config(cfg)?;
 
 	let mut failures = Vec::new();
@@ -312,13 +323,19 @@ fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<String> {
 
 	if failures.is_empty() {
 		output.push_str("\nResult: PASS\n");
-		Ok(output)
+		Ok(Evaluation {
+			report: output,
+			passed: true,
+		})
 	} else {
 		output.push_str("\nResult: FAIL\n");
 		for failure in &failures {
 			output.push_str(&format!("- {failure}\n"));
 		}
-		bail!("{output}")
+		Ok(Evaluation {
+			report: output,
+			passed: false,
+		})
 	}
 }
 
@@ -383,6 +400,19 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 	}
 
 	#[test]
+	fn parses_placeholder_latency_as_zero() {
+		let csv = "\
+Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
+[C]reate,1s,1.00 ms,2.00 ms,-,-,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,1000.00,0,0,0,0,0,0,0,0,0/0/0
+";
+
+		let rows = parse_crud_bench_csv(csv.as_bytes()).expect("parse CSV");
+
+		assert_eq!(rows["put_c"].p95_ms, 0.0);
+		assert_eq!(rows["put_c"].p99_ms, 0.0);
+	}
+
+	#[test]
 	fn skips_rows_with_placeholder_ops() {
 		let csv = "\
 Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
@@ -408,6 +438,26 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 	}
 
 	#[test]
+	fn requires_latency_csvs_as_a_pair() {
+		let err = Args::try_parse_from([
+			"perf-gate",
+			"--baseline-sync",
+			"baseline-sync.csv",
+			"--current-sync",
+			"current-sync.csv",
+			"--baseline-nosync",
+			"baseline-nosync.csv",
+			"--current-nosync",
+			"current-nosync.csv",
+			"--baseline-latency-sync",
+			"baseline-latency-sync.csv",
+		])
+		.expect_err("missing current latency CSV fails");
+
+		assert!(err.to_string().contains("--current-latency-sync"));
+	}
+
+	#[test]
 	fn passes_when_ops_and_ratio_gates_hold() {
 		let baseline_sync = parse_crud_bench_csv(CSV.as_bytes()).expect("parse baseline sync");
 		let current_sync = rows_with_ops(&[("put_c", 1100.0), ("batch_create_1000", 550.0)]);
@@ -430,8 +480,9 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 			current_latency_sync: None,
 		};
 
-		let report = evaluate(&cfg, &inputs).expect("gate passes");
-		assert!(report.contains("Result: PASS"));
+		let eval = evaluate(&cfg, &inputs).expect("gate evaluates");
+		assert!(eval.passed);
+		assert!(eval.report.contains("Result: PASS"));
 	}
 
 	#[test]
@@ -453,8 +504,9 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 			current_latency_sync: None,
 		};
 
-		let err = evaluate(&cfg, &inputs).expect_err("gate fails");
-		assert!(err.to_string().contains("regressed -10.00%"));
+		let eval = evaluate(&cfg, &inputs).expect("gate evaluates");
+		assert!(!eval.passed);
+		assert!(eval.report.contains("regressed -10.00%"));
 	}
 
 	#[test]
@@ -491,9 +543,10 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 			current_latency_sync: None,
 		};
 
-		let report = evaluate(&cfg, &inputs).expect("gate passes");
+		let eval = evaluate(&cfg, &inputs).expect("gate evaluates");
 
-		assert!(report.contains("Result: PASS"));
+		assert!(eval.passed);
+		assert!(eval.report.contains("Result: PASS"));
 	}
 
 	#[test]
@@ -515,9 +568,10 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 			current_latency_sync: None,
 		};
 
-		let err = evaluate(&cfg, &inputs).expect_err("gate fails");
+		let eval = evaluate(&cfg, &inputs).expect("gate evaluates");
 
-		assert!(err.to_string().contains("below -5.00%"));
+		assert!(!eval.passed);
+		assert!(eval.report.contains("below -5.00%"));
 	}
 
 	#[test]
@@ -539,8 +593,9 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 			current_latency_sync: Some(rows_with_latency(&[("put_c", 1.2, 2.3)])),
 		};
 
-		let err = evaluate(&cfg, &inputs).expect_err("gate fails");
-		assert!(err.to_string().contains("p95 regressed 20.00%"));
+		let eval = evaluate(&cfg, &inputs).expect("gate evaluates");
+		assert!(!eval.passed);
+		assert!(eval.report.contains("p95 regressed 20.00%"));
 	}
 
 	fn rows_with_ops(rows: &[(&str, f64)]) -> BenchCsv {
