@@ -165,11 +165,11 @@ performance-sensitive storage change:
 
 ```bash
 cargo run --release --bin perf-gate -- \
-  --baseline-sync <previous-toykv-sync.csv> \
-  --current-sync <current-toykv-sync.csv> \
-  --baseline-nosync <previous-toykv-nosync.csv> \
-  --current-nosync <current-toykv-nosync.csv> \
-  --fjall-sync <current-fjall-sync.csv>
+  --baseline-sync baseline-sync.csv \
+  --current-sync current-sync.csv \
+  --baseline-nosync baseline-nosync.csv \
+  --current-nosync current-nosync.csv \
+  --fjall-sync fjall-sync.csv
 ```
 
 Add `--baseline-latency-sync` and `--current-latency-sync` with single-client

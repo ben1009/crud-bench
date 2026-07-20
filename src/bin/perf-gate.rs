@@ -178,7 +178,12 @@ fn column_index(header: &csv::StringRecord, name: &str) -> Result<usize> {
 }
 
 fn parse_number(cell: &str, label: &str) -> Result<f64> {
-	cell.trim().parse::<f64>().with_context(|| format!("invalid {label} value {cell:?}"))
+	let value =
+		cell.trim().parse::<f64>().with_context(|| format!("invalid {label} value {cell:?}"))?;
+	if !value.is_finite() || value < 0.0 {
+		bail!("invalid {label} value {cell:?}: must be a non-negative number");
+	}
+	Ok(value)
 }
 
 fn parse_duration_ms(cell: &str) -> Result<f64> {
@@ -413,6 +418,23 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 		assert_eq!(rows["put_c"].p95_ms, 0.0);
 		assert_eq!(rows["put_c"].p99_ms, 0.0);
+	}
+
+	#[test]
+	fn rejects_invalid_numeric_values() {
+		for ops in ["NaN", "-1.0"] {
+			let csv = format!(
+				"\
+Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
+[C]reate,1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,{ops},0,0,0,0,0,0,0,0,0/0/0
+"
+			);
+
+			let err =
+				parse_crud_bench_csv(csv.as_bytes()).expect_err("invalid numeric value fails");
+
+			assert!(err.to_string().contains("must be a non-negative number"));
+		}
 	}
 
 	#[test]
