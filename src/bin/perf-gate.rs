@@ -1,6 +1,8 @@
 use std::collections::HashMap;
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -87,7 +89,7 @@ struct Evaluation {
 
 type BenchCsv = HashMap<String, BenchRow>;
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
 	let args = Args::parse();
 	let rows = if args.rows.is_empty() {
 		DEFAULT_ROWS.iter().map(|row| row.to_string()).collect()
@@ -128,18 +130,18 @@ fn main() -> Result<()> {
 	let eval = evaluate(&cfg, &inputs)?;
 	print!("{}", eval.report);
 	if !eval.passed {
-		std::process::exit(1);
+		return Ok(ExitCode::FAILURE);
 	}
-	Ok(())
+	Ok(ExitCode::SUCCESS)
 }
 
 fn read_crud_bench_csv(path: &Path) -> Result<BenchCsv> {
-	let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-	parse_crud_bench_csv(&raw).with_context(|| format!("failed to parse {}", path.display()))
+	let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+	parse_crud_bench_csv(file).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn parse_crud_bench_csv(raw: &[u8]) -> Result<BenchCsv> {
-	let mut reader = csv::Reader::from_reader(raw);
+fn parse_crud_bench_csv<R: Read>(reader: R) -> Result<BenchCsv> {
+	let mut reader = csv::Reader::from_reader(reader);
 	let header = reader.headers().context("missing CSV header")?.clone();
 	let test_idx = column_index(&header, "Test")?;
 	let ops_idx = column_index(&header, "OPS")?;
