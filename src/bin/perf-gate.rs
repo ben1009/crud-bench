@@ -125,33 +125,35 @@ fn main() -> Result<()> {
 }
 
 fn read_crud_bench_csv(path: &Path) -> Result<BenchCsv> {
-	let raw =
-		fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+	let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
 	parse_crud_bench_csv(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-fn parse_crud_bench_csv(raw: &str) -> Result<BenchCsv> {
-	let mut lines = raw.lines().filter(|line| !line.trim().is_empty());
-	let header = lines.next().context("missing CSV header")?;
-	let header = parse_csv_line(header);
+fn parse_crud_bench_csv(raw: &[u8]) -> Result<BenchCsv> {
+	let mut reader = csv::Reader::from_reader(raw);
+	let header = reader.headers().context("missing CSV header")?.clone();
 	let test_idx = column_index(&header, "Test")?;
 	let ops_idx = column_index(&header, "OPS")?;
 	let p99_idx = column_index(&header, "99th")?;
 	let p95_idx = column_index(&header, "95th")?;
 	let mut rows = HashMap::new();
 
-	for (line_no, line) in lines.enumerate() {
-		let cells = parse_csv_line(line);
-		if cells.len() <= ops_idx {
+	for (line_no, result) in reader.records().enumerate() {
+		let record = result?;
+		if record.len() <= test_idx
+			|| record.len() <= ops_idx
+			|| record.len() <= p95_idx
+			|| record.len() <= p99_idx
+		{
 			bail!("CSV row {} has too few columns", line_no + 2);
 		}
-		let alias = row_alias(&cells[test_idx]);
+		let alias = row_alias(&record[test_idx]);
 		rows.insert(
 			alias,
 			BenchRow {
-				ops: parse_number(&cells[ops_idx], "OPS")?,
-				p95_ms: parse_duration_ms(&cells[p95_idx])?,
-				p99_ms: parse_duration_ms(&cells[p99_idx])?,
+				ops: parse_number(&record[ops_idx], "OPS")?,
+				p95_ms: parse_duration_ms(&record[p95_idx])?,
+				p99_ms: parse_duration_ms(&record[p99_idx])?,
 			},
 		);
 	}
@@ -159,33 +161,8 @@ fn parse_crud_bench_csv(raw: &str) -> Result<BenchCsv> {
 	Ok(rows)
 }
 
-fn column_index(header: &[String], name: &str) -> Result<usize> {
+fn column_index(header: &csv::StringRecord, name: &str) -> Result<usize> {
 	header.iter().position(|col| col == name).ok_or_else(|| anyhow!("missing CSV column {name:?}"))
-}
-
-fn parse_csv_line(line: &str) -> Vec<String> {
-	let mut cells = Vec::new();
-	let mut cell = String::new();
-	let mut in_quotes = false;
-	let mut chars = line.chars().peekable();
-
-	while let Some(ch) = chars.next() {
-		match ch {
-			'"' if in_quotes && chars.peek() == Some(&'"') => {
-				cell.push('"');
-				chars.next();
-			}
-			'"' => in_quotes = !in_quotes,
-			',' if !in_quotes => {
-				cells.push(cell);
-				cell = String::new();
-			}
-			_ => cell.push(ch),
-		}
-	}
-
-	cells.push(cell);
-	cells
 }
 
 fn parse_number(cell: &str, label: &str) -> Result<f64> {
@@ -366,7 +343,7 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 	#[test]
 	fn parses_crud_bench_csv_aliases() {
-		let rows = parse_crud_bench_csv(CSV).expect("parse CSV");
+		let rows = parse_crud_bench_csv(CSV.as_bytes()).expect("parse CSV");
 
 		assert_eq!(rows["put_c"].ops, 1000.0);
 		assert_eq!(rows["put_c"].p95_ms, 1.8);
@@ -374,8 +351,20 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 	}
 
 	#[test]
+	fn parses_quoted_csv_fields() {
+		let csv = "\
+Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
+\"[B]atch::batch_create_1000 (100 batches, of \"\"1000\"\")\",1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,500.00,0,0,0,0,0,0,0,0,0/0/0
+";
+
+		let rows = parse_crud_bench_csv(csv.as_bytes()).expect("parse CSV");
+
+		assert_eq!(rows["batch_create_1000"].ops, 500.0);
+	}
+
+	#[test]
 	fn passes_when_ops_and_ratio_gates_hold() {
-		let baseline_sync = parse_crud_bench_csv(CSV).expect("parse baseline sync");
+		let baseline_sync = parse_crud_bench_csv(CSV.as_bytes()).expect("parse baseline sync");
 		let current_sync = rows_with_ops(&[("put_c", 1100.0), ("batch_create_1000", 550.0)]);
 		let baseline_nosync = rows_with_ops(&[("put_c", 2000.0), ("batch_create_1000", 1000.0)]);
 		let current_nosync = rows_with_ops(&[("put_c", 1900.0), ("batch_create_1000", 950.0)]);
