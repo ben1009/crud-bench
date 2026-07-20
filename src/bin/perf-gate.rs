@@ -363,6 +363,9 @@ fn ratio(numerator: f64, denominator: f64) -> Result<f64> {
 
 fn percent_change(current: f64, baseline: f64) -> f64 {
 	if baseline == 0.0 {
+		if current > 0.0 {
+			return f64::INFINITY;
+		}
 		return 0.0;
 	}
 	(current - baseline) * 100.0 / baseline
@@ -596,6 +599,30 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 		let eval = evaluate(&cfg, &inputs).expect("gate evaluates");
 		assert!(!eval.passed);
 		assert!(eval.report.contains("p95 regressed 20.00%"));
+	}
+
+	#[test]
+	fn fails_when_latency_baseline_placeholder_becomes_measured() {
+		let cfg = GateConfig {
+			rows: vec!["put_c".into()],
+			ratio_rows: vec!["put_c".into()],
+			max_sync_regression_pct: 5.0,
+			min_ratio_improvements: 0,
+			max_latency_regression_pct: 5.0,
+		};
+		let inputs = GateInputs {
+			baseline_sync: rows_with_ops(&[("put_c", 1000.0)]),
+			current_sync: rows_with_ops(&[("put_c", 1000.0)]),
+			baseline_nosync: rows_with_ops(&[("put_c", 2000.0)]),
+			current_nosync: rows_with_ops(&[("put_c", 1900.0)]),
+			fjall_sync: None,
+			baseline_latency_sync: Some(rows_with_latency(&[("put_c", 0.0, 0.0)])),
+			current_latency_sync: Some(rows_with_latency(&[("put_c", 1.0, 2.0)])),
+		};
+
+		let eval = evaluate(&cfg, &inputs).expect("gate evaluates");
+		assert!(!eval.passed);
+		assert!(eval.report.contains("p95 regressed inf%"));
 	}
 
 	fn rows_with_ops(rows: &[(&str, f64)]) -> BenchCsv {
