@@ -161,14 +161,14 @@ fn parse_crud_bench_csv<R: Read>(reader: R) -> Result<BenchCsv> {
 		if record[ops_idx].trim() == "-" {
 			continue;
 		}
-		let alias = row_alias(&record[test_idx]);
+		let label = record[test_idx].trim().to_string();
 		let row = BenchRow {
 			ops: parse_number(&record[ops_idx], "OPS")?,
 			p95_ms: parse_duration_ms(&record[p95_idx])?,
 			p99_ms: parse_duration_ms(&record[p99_idx])?,
 		};
-		if rows.insert(alias.clone(), row).is_some() {
-			bail!("duplicate row alias {alias:?} found in CSV");
+		if rows.insert(label.clone(), row).is_some() {
+			bail!("duplicate row {label:?} found in CSV");
 		}
 	}
 
@@ -358,7 +358,16 @@ fn validate_config(cfg: &GateConfig) -> Result<()> {
 }
 
 fn required_row<'a>(rows: &'a BenchCsv, row: &str, source: &str) -> Result<&'a BenchRow> {
-	rows.get(row).ok_or_else(|| anyhow!("missing row {row:?} in {source} CSV"))
+	if let Some(r) = rows.get(row) {
+		return Ok(r);
+	}
+
+	let matches: Vec<_> = rows.iter().filter(|(label, _)| row_alias(label) == row).collect();
+	match matches.as_slice() {
+		[(_, r)] => Ok(r),
+		[] => bail!("missing row {row:?} in {source} CSV"),
+		_ => bail!("ambiguous row {row:?} in {source} CSV: multiple matches found"),
+	}
 }
 
 fn ratio(numerator: f64, denominator: f64) -> Result<f64> {
@@ -392,9 +401,9 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 	fn parses_crud_bench_csv_aliases() {
 		let rows = parse_crud_bench_csv(CSV.as_bytes()).expect("parse CSV");
 
-		assert_eq!(rows["put_c"].ops, 1000.0);
-		assert_eq!(rows["put_c"].p95_ms, 1.8);
-		assert_eq!(rows["batch_create_1000"].ops, 500.0);
+		assert_eq!(required_row(&rows, "put_c", "test").unwrap().ops, 1000.0);
+		assert_eq!(required_row(&rows, "put_c", "test").unwrap().p95_ms, 1.8);
+		assert_eq!(required_row(&rows, "batch_create_1000", "test").unwrap().ops, 500.0);
 	}
 
 	#[test]
@@ -406,7 +415,7 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 		let rows = parse_crud_bench_csv(csv.as_bytes()).expect("parse CSV");
 
-		assert_eq!(rows["batch_create_1000"].ops, 500.0);
+		assert_eq!(required_row(&rows, "batch_create_1000", "test").unwrap().ops, 500.0);
 	}
 
 	#[test]
@@ -418,8 +427,8 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 		let rows = parse_crud_bench_csv(csv.as_bytes()).expect("parse CSV");
 
-		assert_eq!(rows["put_c"].p95_ms, 0.0);
-		assert_eq!(rows["put_c"].p99_ms, 0.0);
+		assert_eq!(required_row(&rows, "put_c", "test").unwrap().p95_ms, 0.0);
+		assert_eq!(required_row(&rows, "put_c", "test").unwrap().p99_ms, 0.0);
 	}
 
 	#[test]
@@ -448,11 +457,11 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 		let rows = parse_crud_bench_csv(csv.as_bytes()).expect("parse CSV");
 
-		assert!(!rows.contains_key("put_c"));
+		assert!(required_row(&rows, "put_c", "test").is_err());
 	}
 
 	#[test]
-	fn rejects_duplicate_row_aliases() {
+	fn rejects_duplicate_rows() {
 		let csv = "\
 Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
 [C]reate,1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,1000.00,0,0,0,0,0,0,0,0,0/0/0
@@ -461,7 +470,22 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 		let err = parse_crud_bench_csv(csv.as_bytes()).expect_err("duplicate row fails");
 
-		assert!(err.to_string().contains("duplicate row alias"));
+		assert!(err.to_string().contains("duplicate row"));
+	}
+
+	#[test]
+	fn detects_ambiguous_row_aliases() {
+		let csv = "\
+Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
+[B]atch::batch_create_1000 (100 batches of 1000),1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,500.00,0,0,0,0,0,0,0,0,0/0/0
+[B]atch::batch_create_1000 (500 batches of 1000),1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,600.00,0,0,0,0,0,0,0,0,0/0/0
+";
+
+		let rows = parse_crud_bench_csv(csv.as_bytes()).expect("parse CSV");
+		let err =
+			required_row(&rows, "batch_create_1000", "test").expect_err("ambiguous lookup fails");
+
+		assert!(err.to_string().contains("ambiguous row"));
 	}
 
 	#[test]
