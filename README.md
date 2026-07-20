@@ -164,7 +164,7 @@ Use `perf-gate` to compare generated CSV artifacts before accepting a
 performance-sensitive storage change:
 
 ```bash
-cargo run --bin perf-gate -- \
+cargo run --release --bin perf-gate -- \
   --baseline-sync <previous-toykv-sync.csv> \
   --current-sync <current-toykv-sync.csv> \
   --baseline-nosync <previous-toykv-nosync.csv> \

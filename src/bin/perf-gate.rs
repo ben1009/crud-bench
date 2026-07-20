@@ -101,6 +101,7 @@ fn main() -> Result<()> {
 		min_ratio_improvements: args.min_ratio_improvements,
 		max_latency_regression_pct: args.max_latency_regression_pct,
 	};
+	validate_config(&cfg)?;
 	let inputs = GateInputs {
 		baseline_sync: read_crud_bench_csv(&args.baseline_sync)?,
 		current_sync: read_crud_bench_csv(&args.current_sync)?,
@@ -147,15 +148,18 @@ fn parse_crud_bench_csv(raw: &[u8]) -> Result<BenchCsv> {
 		{
 			bail!("CSV row {} has too few columns", line_no + 2);
 		}
+		if record[ops_idx].trim() == "-" {
+			continue;
+		}
 		let alias = row_alias(&record[test_idx]);
-		rows.insert(
-			alias,
-			BenchRow {
-				ops: parse_number(&record[ops_idx], "OPS")?,
-				p95_ms: parse_duration_ms(&record[p95_idx])?,
-				p99_ms: parse_duration_ms(&record[p99_idx])?,
-			},
-		);
+		let row = BenchRow {
+			ops: parse_number(&record[ops_idx], "OPS")?,
+			p95_ms: parse_duration_ms(&record[p95_idx])?,
+			p99_ms: parse_duration_ms(&record[p99_idx])?,
+		};
+		if rows.insert(alias.clone(), row).is_some() {
+			bail!("duplicate row alias {alias:?} found in CSV");
+		}
 	}
 
 	Ok(rows)
@@ -199,6 +203,8 @@ fn row_alias(label: &str) -> String {
 }
 
 fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<String> {
+	validate_config(cfg)?;
+
 	let mut failures = Vec::new();
 	let mut output = String::from("ToyKV sync perf gate\n\n");
 	output.push_str("Sync OPS regression gate:\n");
@@ -256,8 +262,11 @@ fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<String> {
 				"- {row}: ToyKV {:.2} / Fjall {:.2} OPS ({:+.2}%)\n",
 				current.ops, fjall_row.ops, delta
 			));
-			if current.ops < fjall_row.ops {
-				failures.push(format!("{row} current sync OPS is below Fjall by {delta:.2}%"));
+			if delta < -cfg.max_sync_regression_pct {
+				failures.push(format!(
+					"{row} current sync OPS is below Fjall by {delta:.2}%, below -{:.2}%",
+					cfg.max_sync_regression_pct
+				));
 			}
 		}
 	}
@@ -313,6 +322,17 @@ fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<String> {
 	}
 }
 
+fn validate_config(cfg: &GateConfig) -> Result<()> {
+	if cfg.min_ratio_improvements > cfg.ratio_rows.len() {
+		bail!(
+			"--min-ratio-improvements ({}) cannot be greater than the number of ratio rows ({})",
+			cfg.min_ratio_improvements,
+			cfg.ratio_rows.len()
+		);
+	}
+	Ok(())
+}
+
 fn required_row<'a>(rows: &'a BenchCsv, row: &str, source: &str) -> Result<&'a BenchRow> {
 	rows.get(row).ok_or_else(|| anyhow!("missing row {row:?} in {source} CSV"))
 }
@@ -363,6 +383,31 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 	}
 
 	#[test]
+	fn skips_rows_with_placeholder_ops() {
+		let csv = "\
+Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
+[C]reate,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-
+";
+
+		let rows = parse_crud_bench_csv(csv.as_bytes()).expect("parse CSV");
+
+		assert!(!rows.contains_key("put_c"));
+	}
+
+	#[test]
+	fn rejects_duplicate_row_aliases() {
+		let csv = "\
+Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_min,CPU_max,Memory_peak,Memory_avg,Reads,Writes,System load,System load (1m/5m/15m)
+[C]reate,1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,1000.00,0,0,0,0,0,0,0,0,0/0/0
+[C]reate,1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,900.00,0,0,0,0,0,0,0,0,0/0/0
+";
+
+		let err = parse_crud_bench_csv(csv.as_bytes()).expect_err("duplicate row fails");
+
+		assert!(err.to_string().contains("duplicate row alias"));
+	}
+
+	#[test]
 	fn passes_when_ops_and_ratio_gates_hold() {
 		let baseline_sync = parse_crud_bench_csv(CSV.as_bytes()).expect("parse baseline sync");
 		let current_sync = rows_with_ops(&[("put_c", 1100.0), ("batch_create_1000", 550.0)]);
@@ -410,6 +455,69 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 		let err = evaluate(&cfg, &inputs).expect_err("gate fails");
 		assert!(err.to_string().contains("regressed -10.00%"));
+	}
+
+	#[test]
+	fn rejects_impossible_min_ratio_improvements() {
+		let cfg = GateConfig {
+			rows: vec!["put_c".into()],
+			ratio_rows: vec!["put_c".into()],
+			max_sync_regression_pct: 5.0,
+			min_ratio_improvements: 2,
+			max_latency_regression_pct: 5.0,
+		};
+
+		let err = validate_config(&cfg).expect_err("config fails");
+
+		assert!(err.to_string().contains("cannot be greater than the number of ratio rows"));
+	}
+
+	#[test]
+	fn allows_fjall_relative_difference_within_tolerance() {
+		let cfg = GateConfig {
+			rows: vec!["put_c".into()],
+			ratio_rows: vec!["put_c".into()],
+			max_sync_regression_pct: 5.0,
+			min_ratio_improvements: 0,
+			max_latency_regression_pct: 5.0,
+		};
+		let inputs = GateInputs {
+			baseline_sync: rows_with_ops(&[("put_c", 100.0)]),
+			current_sync: rows_with_ops(&[("put_c", 96.0)]),
+			baseline_nosync: rows_with_ops(&[("put_c", 2000.0)]),
+			current_nosync: rows_with_ops(&[("put_c", 2000.0)]),
+			fjall_sync: Some(rows_with_ops(&[("put_c", 100.0)])),
+			baseline_latency_sync: None,
+			current_latency_sync: None,
+		};
+
+		let report = evaluate(&cfg, &inputs).expect("gate passes");
+
+		assert!(report.contains("Result: PASS"));
+	}
+
+	#[test]
+	fn fails_when_fjall_relative_difference_exceeds_tolerance() {
+		let cfg = GateConfig {
+			rows: vec!["put_c".into()],
+			ratio_rows: vec!["put_c".into()],
+			max_sync_regression_pct: 5.0,
+			min_ratio_improvements: 0,
+			max_latency_regression_pct: 5.0,
+		};
+		let inputs = GateInputs {
+			baseline_sync: rows_with_ops(&[("put_c", 1000.0)]),
+			current_sync: rows_with_ops(&[("put_c", 94.0)]),
+			baseline_nosync: rows_with_ops(&[("put_c", 2000.0)]),
+			current_nosync: rows_with_ops(&[("put_c", 2000.0)]),
+			fjall_sync: Some(rows_with_ops(&[("put_c", 100.0)])),
+			baseline_latency_sync: None,
+			current_latency_sync: None,
+		};
+
+		let err = evaluate(&cfg, &inputs).expect_err("gate fails");
+
+		assert!(err.to_string().contains("below -5.00%"));
 	}
 
 	#[test]
