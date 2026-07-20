@@ -158,6 +158,23 @@ For more detailed help information run the following command:
 cargo run -r -- --help
 ```
 
+### Performance gates
+
+Use `perf-gate` to compare generated CSV artifacts before accepting a
+performance-sensitive storage change:
+
+```bash
+cargo run --release --bin perf-gate -- \
+  --baseline-sync baseline-sync.csv \
+  --current-sync current-sync.csv \
+  --baseline-nosync baseline-nosync.csv \
+  --current-nosync current-nosync.csv \
+  --fjall-sync fjall-sync.csv
+```
+
+Add `--baseline-latency-sync` and `--current-latency-sync` with single-client
+sync CSVs to enforce the p95/p99 latency gate.
+
 ### Comparing `result*.json` files in the browser
 
 Open [`compare/index.html`](compare/index.html) locally (drag and drop benchmark JSON artefacts). Rows and labels match CLI/CSV ordering from [`src/result.rs`](src/result.rs). Nothing is uploaded; ApexCharts loads from jsDelivr (works offline only if that script is cached or vendored beside the HTML file).
