@@ -454,8 +454,10 @@ impl Benchmark {
 				});
 				// Optional mixed read+write legs on the heap path (one per `with_writes` entry)
 				for spec in write_specs {
-					let mixed_without_index = self
-						.run_operation::<C, D>(
+					let mixed_without_index = if self.skip_writes {
+						None
+					} else {
+						self.run_operation::<C, D>(
 							&clients,
 							BenchmarkOperation::ScanWithWrites(
 								scan.clone(),
@@ -466,7 +468,8 @@ impl Benchmark {
 							vp.clone(),
 							iterations,
 						)
-						.await?;
+						.await?
+					};
 					runs.push(ScanRun {
 						workload: ScanWorkload::ReadWrite {
 							write_ratio_percent: writes_ratio_percent(spec),
@@ -504,7 +507,9 @@ impl Benchmark {
 						.await?;
 					let mut iw = Vec::with_capacity(w);
 					for spec in write_specs {
-						iw.push(
+						let result = if self.skip_writes {
+							None
+						} else {
 							self.run_operation::<C, D>(
 								&clients,
 								BenchmarkOperation::ScanWithWrites(
@@ -516,8 +521,9 @@ impl Benchmark {
 								vp.clone(),
 								iterations,
 							)
-							.await?,
-						);
+							.await?
+						};
+						iw.push(result);
 					}
 					let index_remove = self
 						.run_operation::<C, D>(
@@ -591,8 +597,10 @@ impl Benchmark {
 					result: without_index,
 				});
 				for spec in write_specs {
-					let mixed_without_index = self
-						.run_operation::<C, D>(
+					let mixed_without_index = if self.skip_writes {
+						None
+					} else {
+						self.run_operation::<C, D>(
 							&clients,
 							BenchmarkOperation::ScanWithWrites(
 								scan.clone(),
@@ -603,7 +611,8 @@ impl Benchmark {
 							vp.clone(),
 							iterations,
 						)
-						.await?;
+						.await?
+					};
 					runs.push(ScanRun {
 						workload: ScanWorkload::ReadWrite {
 							write_ratio_percent: writes_ratio_percent(spec),
@@ -648,24 +657,21 @@ impl Benchmark {
 		// Run the "batch" benchmarks
 		let mut batch_results = Vec::with_capacity(batches.len());
 		for batch in batches {
-			// Skip batch delete if --skip-deletes or --skip-writes
-			if (self.skip_deletes || self.skip_writes)
-				&& matches!(batch.operation, crate::BatchOperationType::Delete)
-			{
-				continue;
-			}
-			// Skip batch create/update if --skip-writes
-			if self.skip_writes
-				&& matches!(
-					batch.operation,
-					crate::BatchOperationType::Create | crate::BatchOperationType::Update
-				) {
-				continue;
-			}
 			// Get the name of the batch operation
 			let name = batch.name.clone();
 			let groups = batch.batch_size;
 			let iterations = batch.iterations.map(|s| s as u32).unwrap_or(self.samples);
+			let skip_batch = ((self.skip_deletes || self.skip_writes)
+				&& matches!(batch.operation, crate::BatchOperationType::Delete))
+				|| (self.skip_writes
+					&& matches!(
+						batch.operation,
+						crate::BatchOperationType::Create | crate::BatchOperationType::Update
+					));
+			if skip_batch {
+				batch_results.push((name, iterations, groups, None));
+				continue;
+			}
 			// Determine the batch operation type
 			let operation = match batch.operation {
 				crate::BatchOperationType::Create => BenchmarkOperation::BatchCreate(batch.clone()),

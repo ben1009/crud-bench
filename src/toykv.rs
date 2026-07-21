@@ -15,20 +15,15 @@ use toykv::vlog::ValueSeparationOptions;
 
 const DATABASE_DIR: &str = "toykv_data";
 
-fn reads_only() -> bool {
-	std::env::var("READS_ONLY").is_ok()
-}
-
-fn preserve_db() -> bool {
-	std::env::var("PRESERVE_DB").is_ok()
-}
-
-fn load_only() -> bool {
-	std::env::var("LOAD_ONLY").is_ok()
+fn env_flag(name: &str) -> bool {
+	std::env::var(name).is_ok()
 }
 
 pub(crate) struct ToyKvClientProvider {
 	engine: Arc<KvEngine>,
+	reads_only: bool,
+	preserve_db: bool,
+	load_only: bool,
 }
 
 impl BenchmarkEngine<ToyKvClient> for ToyKvClientProvider {
@@ -37,8 +32,12 @@ impl BenchmarkEngine<ToyKvClient> for ToyKvClientProvider {
 	}
 
 	async fn setup(_kt: KeyType, _columns: Columns, options: &Benchmark) -> Result<Self> {
+		let reads_only = env_flag("READS_ONLY");
+		let preserve_db = env_flag("PRESERVE_DB");
+		let load_only = env_flag("LOAD_ONLY");
+
 		// Cleanup the data directory (skip if READS_ONLY or PRESERVE_DB to reuse existing data)
-		if !reads_only() && !preserve_db() {
+		if !reads_only && !preserve_db {
 			std::fs::remove_dir_all(DATABASE_DIR).ok();
 		}
 
@@ -71,18 +70,27 @@ impl BenchmarkEngine<ToyKvClient> for ToyKvClientProvider {
 
 		Ok(Self {
 			engine,
+			reads_only,
+			preserve_db,
+			load_only,
 		})
 	}
 
 	async fn create_client(&self) -> Result<ToyKvClient> {
 		Ok(ToyKvClient {
 			engine: self.engine.clone(),
+			reads_only: self.reads_only,
+			preserve_db: self.preserve_db,
+			load_only: self.load_only,
 		})
 	}
 }
 
 pub(crate) struct ToyKvClient {
 	engine: Arc<KvEngine>,
+	reads_only: bool,
+	preserve_db: bool,
+	load_only: bool,
 }
 
 impl BenchmarkClient for ToyKvClient {
@@ -90,14 +98,14 @@ impl BenchmarkClient for ToyKvClient {
 
 	async fn shutdown(&self) -> Result<()> {
 		self.engine.close()?;
-		if !reads_only() && !preserve_db() {
+		if !self.reads_only && !self.preserve_db {
 			std::fs::remove_dir_all(DATABASE_DIR).ok();
 		}
 		Ok(())
 	}
 
 	async fn create_u32(&self, key: u32, val: BenchValue) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let encoded = val.encode()?;
@@ -106,7 +114,7 @@ impl BenchmarkClient for ToyKvClient {
 	}
 
 	async fn create_string(&self, key: String, val: BenchValue) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let encoded = val.encode()?;
@@ -129,7 +137,7 @@ impl BenchmarkClient for ToyKvClient {
 	}
 
 	async fn update_u32(&self, key: u32, val: BenchValue) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let encoded = val.encode()?;
@@ -138,7 +146,7 @@ impl BenchmarkClient for ToyKvClient {
 	}
 
 	async fn update_string(&self, key: String, val: BenchValue) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let encoded = val.encode()?;
@@ -147,7 +155,7 @@ impl BenchmarkClient for ToyKvClient {
 	}
 
 	async fn delete_u32(&self, key: u32) -> Result<()> {
-		if reads_only() || load_only() {
+		if self.reads_only || self.load_only {
 			return Ok(());
 		}
 		self.engine.delete(&key.to_ne_bytes())?;
@@ -155,7 +163,7 @@ impl BenchmarkClient for ToyKvClient {
 	}
 
 	async fn delete_string(&self, key: String) -> Result<()> {
-		if reads_only() || load_only() {
+		if self.reads_only || self.load_only {
 			return Ok(());
 		}
 		self.engine.delete(key.as_bytes())?;
@@ -180,7 +188,7 @@ impl BenchmarkClient for ToyKvClient {
 		&self,
 		key_vals: impl Iterator<Item = (u32, BenchValue)> + Send,
 	) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let batch: Vec<WriteBatchRecord<Vec<u8>>> = key_vals
@@ -194,7 +202,7 @@ impl BenchmarkClient for ToyKvClient {
 		&self,
 		key_vals: impl Iterator<Item = (String, BenchValue)> + Send,
 	) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let batch: Vec<WriteBatchRecord<Vec<u8>>> = key_vals
@@ -232,7 +240,7 @@ impl BenchmarkClient for ToyKvClient {
 		&self,
 		key_vals: impl Iterator<Item = (u32, BenchValue)> + Send,
 	) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let batch: Vec<WriteBatchRecord<Vec<u8>>> = key_vals
@@ -246,7 +254,7 @@ impl BenchmarkClient for ToyKvClient {
 		&self,
 		key_vals: impl Iterator<Item = (String, BenchValue)> + Send,
 	) -> Result<()> {
-		if reads_only() {
+		if self.reads_only {
 			return Ok(());
 		}
 		let batch: Vec<WriteBatchRecord<Vec<u8>>> = key_vals
@@ -257,7 +265,7 @@ impl BenchmarkClient for ToyKvClient {
 	}
 
 	async fn batch_delete_u32(&self, keys: impl Iterator<Item = u32> + Send) -> Result<()> {
-		if reads_only() || load_only() {
+		if self.reads_only || self.load_only {
 			return Ok(());
 		}
 		let batch: Vec<WriteBatchRecord<Vec<u8>>> =
@@ -267,7 +275,7 @@ impl BenchmarkClient for ToyKvClient {
 	}
 
 	async fn batch_delete_string(&self, keys: impl Iterator<Item = String> + Send) -> Result<()> {
-		if reads_only() || load_only() {
+		if self.reads_only || self.load_only {
 			return Ok(());
 		}
 		let batch: Vec<WriteBatchRecord<Vec<u8>>> =

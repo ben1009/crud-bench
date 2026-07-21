@@ -36,7 +36,6 @@ default = [
     "surrealdb2",
     "surrealkv",
     "surrealmx",
-    "toykv",
 ]
 arangodb = ["dep:arangors", "dep:async-trait", "dep:http", "dep:reqwest"]
 dragonfly = ["dep:redis"]

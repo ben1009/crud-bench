@@ -52,8 +52,8 @@ impl BenchmarkEngine<FjallClient> for FjallClientProvider {
 	}
 	/// Initiates a new datastore benchmarking engine
 	async fn setup(_kt: KeyType, _columns: Columns, options: &Benchmark) -> Result<Self> {
-		// Cleanup the data directory (skip if READS_ONLY to reuse existing data)
-		if !reads_only() {
+		// Cleanup the data directory (skip if READS_ONLY or PRESERVE_DB to reuse existing data)
+		if !reads_only() && !preserve_db() {
 			std::fs::remove_dir_all(DATABASE_DIR).ok();
 		}
 		// Calculate memory allocation
