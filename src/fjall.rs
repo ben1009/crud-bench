@@ -17,6 +17,18 @@ use std::time::Duration;
 
 const DATABASE_DIR: &str = "fjall";
 
+fn reads_only() -> bool {
+	std::env::var("READS_ONLY").is_ok()
+}
+
+fn preserve_db() -> bool {
+	std::env::var("PRESERVE_DB").is_ok()
+}
+
+fn load_only() -> bool {
+	std::env::var("LOAD_ONLY").is_ok()
+}
+
 /// Calculate Fjall specific memory allocation
 fn calculate_fjall_memory() -> u64 {
 	// Load the system memory
@@ -40,8 +52,10 @@ impl BenchmarkEngine<FjallClient> for FjallClientProvider {
 	}
 	/// Initiates a new datastore benchmarking engine
 	async fn setup(_kt: KeyType, _columns: Columns, options: &Benchmark) -> Result<Self> {
-		// Cleanup the data directory
-		std::fs::remove_dir_all(DATABASE_DIR).ok();
+		// Cleanup the data directory (skip if READS_ONLY to reuse existing data)
+		if !reads_only() {
+			std::fs::remove_dir_all(DATABASE_DIR).ok();
+		}
 		// Calculate memory allocation
 		let memory = calculate_fjall_memory();
 		// Configure and create the database
@@ -99,7 +113,9 @@ impl BenchmarkClient for FjallClient {
 
 	async fn shutdown(&self) -> Result<()> {
 		// Cleanup the data directory
-		std::fs::remove_dir_all(DATABASE_DIR).ok();
+		if !reads_only() && !preserve_db() {
+			std::fs::remove_dir_all(DATABASE_DIR).ok();
+		}
 		// Ok
 		Ok(())
 	}
@@ -211,6 +227,9 @@ impl BenchmarkClient for FjallClient {
 
 impl FjallClient {
 	async fn create_bytes(&self, key: &[u8], val: BenchValue) -> Result<()> {
+		if reads_only() {
+			return Ok(());
+		}
 		// Serialise the value
 		let val = val.encode()?;
 		// Set the transaction durability
@@ -241,6 +260,9 @@ impl FjallClient {
 	}
 
 	async fn update_bytes(&self, key: &[u8], val: BenchValue) -> Result<()> {
+		if reads_only() {
+			return Ok(());
+		}
 		// Serialise the value
 		let val = val.encode()?;
 		// Set the transaction durability
@@ -258,6 +280,9 @@ impl FjallClient {
 	}
 
 	async fn delete_bytes(&self, key: &[u8]) -> Result<()> {
+		if reads_only() || load_only() {
+			return Ok(());
+		}
 		// Set the transaction durability
 		let durability = if self.sync {
 			Some(PersistMode::SyncData)
@@ -276,6 +301,9 @@ impl FjallClient {
 		&self,
 		key_vals: impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
 	) -> Result<()> {
+		if reads_only() {
+			return Ok(());
+		}
 		// Set the transaction durability
 		let durability = if self.sync {
 			Some(PersistMode::SyncData)
@@ -316,6 +344,9 @@ impl FjallClient {
 		&self,
 		key_vals: impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
 	) -> Result<()> {
+		if reads_only() {
+			return Ok(());
+		}
 		// Set the transaction durability
 		let durability = if self.sync {
 			Some(PersistMode::SyncData)
@@ -335,6 +366,9 @@ impl FjallClient {
 	}
 
 	async fn batch_delete_bytes(&self, keys: impl Iterator<Item = Vec<u8>>) -> Result<()> {
+		if reads_only() || load_only() {
+			return Ok(());
+		}
 		// Set the transaction durability
 		let durability = if self.sync {
 			Some(PersistMode::SyncData)

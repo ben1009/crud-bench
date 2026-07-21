@@ -120,6 +120,10 @@ pub(crate) struct Benchmark {
 	pub(crate) privileged: bool,
 	/// The container image to use
 	pub(crate) image: Option<String>,
+	/// Whether to skip the delete phase
+	pub(crate) skip_deletes: bool,
+	/// Whether to skip all write phases (create, update, delete, batch writes)
+	pub(crate) skip_writes: bool,
 	/// The server endpoint to connect to
 	pub(crate) endpoint: Option<String>,
 	/// The number of clients to spawn
@@ -163,6 +167,8 @@ impl Benchmark {
 			pid: args.pid,
 			persisted: args.persisted,
 			optimised: args.optimised,
+			skip_deletes: args.skip_deletes,
+			skip_writes: args.skip_writes,
 			operation_timeout: Duration::from_secs(args.operation_timeout),
 			bench_ui: BenchUi::new(args.color),
 			emit_phase_markers,
@@ -235,16 +241,19 @@ impl Benchmark {
 		if self.emit_phase_markers {
 			self.bench_ui.println_plain("Benchmark starting");
 		}
-		// Run the "creates" benchmark
-		let creates = self
-			.run_operation::<C, D>(
+		// Run the "creates" benchmark (skipped if --skip-writes)
+		let creates = if self.skip_writes {
+			None
+		} else {
+			self.run_operation::<C, D>(
 				&clients,
 				BenchmarkOperation::Create,
 				kp,
 				vp.clone(),
 				self.samples,
 			)
-			.await?;
+			.await?
+		};
 		// Compact the datastore
 		self.maybe_compact_datastore::<C, E>(&engine).await?;
 		// Run the "reads" benchmark
@@ -253,16 +262,19 @@ impl Benchmark {
 			.await?;
 		// Compact the datastore
 		self.maybe_compact_datastore::<C, E>(&engine).await?;
-		// Run the "reads" benchmark
-		let updates = self
-			.run_operation::<C, D>(
+		// Run the "updates" benchmark (skipped if --skip-writes)
+		let updates = if self.skip_writes {
+			None
+		} else {
+			self.run_operation::<C, D>(
 				&clients,
 				BenchmarkOperation::Update,
 				kp,
 				vp.clone(),
 				self.samples,
 			)
-			.await?;
+			.await?
+		};
 		// Compact the datastore
 		self.maybe_compact_datastore::<C, E>(&engine).await?;
 		// Run the "scan" benchmarks
@@ -613,17 +625,21 @@ impl Benchmark {
 		}
 		// Compact the datastore
 		self.maybe_compact_datastore::<C, E>(&engine).await?;
-		self.bench_ui.section_header("Delete");
-		// Run the "deletes" benchmark
-		let deletes = self
-			.run_operation::<C, D>(
+		// Run the "deletes" benchmark (skipped if --skip-deletes or --skip-writes)
+		let deletes = if self.skip_deletes || self.skip_writes {
+			self.bench_ui.section_header("Delete (skipped)");
+			None
+		} else {
+			self.bench_ui.section_header("Delete");
+			self.run_operation::<C, D>(
 				&clients,
 				BenchmarkOperation::Delete,
 				kp,
 				vp.clone(),
 				self.samples,
 			)
-			.await?;
+			.await?
+		};
 		// Compact the datastore
 		self.maybe_compact_datastore::<C, E>(&engine).await?;
 		if !batches.is_empty() {
@@ -632,6 +648,20 @@ impl Benchmark {
 		// Run the "batch" benchmarks
 		let mut batch_results = Vec::with_capacity(batches.len());
 		for batch in batches {
+			// Skip batch delete if --skip-deletes or --skip-writes
+			if (self.skip_deletes || self.skip_writes)
+				&& matches!(batch.operation, crate::BatchOperationType::Delete)
+			{
+				continue;
+			}
+			// Skip batch create/update if --skip-writes
+			if self.skip_writes
+				&& matches!(
+					batch.operation,
+					crate::BatchOperationType::Create | crate::BatchOperationType::Update
+				) {
+				continue;
+			}
 			// Get the name of the batch operation
 			let name = batch.name.clone();
 			let groups = batch.batch_size;
