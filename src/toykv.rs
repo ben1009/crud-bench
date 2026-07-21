@@ -5,7 +5,7 @@ use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
 use crate::value::BenchValue;
 use crate::valueprovider::Columns;
 use crate::{Benchmark, KeyType, Projection, Scan};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,14 +116,14 @@ impl BenchmarkClient for ToyKvClient {
 
 	async fn read_u32(&self, key: u32) -> Result<BenchValue> {
 		let res = self.engine.get(&key.to_ne_bytes())?;
-		let bytes = res.expect("key should exist");
+		let bytes = res.ok_or_else(|| anyhow!("key should exist"))?;
 		let val = BenchValue::decode(&bytes)?;
 		Ok(black_box(val))
 	}
 
 	async fn read_string(&self, key: String) -> Result<BenchValue> {
 		let res = self.engine.get(key.as_bytes())?;
-		let bytes = res.expect("key should exist");
+		let bytes = res.ok_or_else(|| anyhow!("key should exist"))?;
 		let val = BenchValue::decode(&bytes)?;
 		Ok(black_box(val))
 	}
@@ -209,7 +209,7 @@ impl BenchmarkClient for ToyKvClient {
 		let key_refs: Vec<&[u8]> = key_bytes.iter().map(|k| k.as_slice()).collect();
 		let results = self.engine.batch_get(&key_refs);
 		for res in results {
-			let bytes = res?.expect("key should exist");
+			let bytes = res?.ok_or_else(|| anyhow!("key should exist"))?;
 			let val = BenchValue::decode(&bytes)?;
 			black_box(val);
 		}
@@ -221,7 +221,7 @@ impl BenchmarkClient for ToyKvClient {
 		let key_refs: Vec<&[u8]> = key_owned.iter().map(|k| k.as_bytes()).collect();
 		let results = self.engine.batch_get(&key_refs);
 		for res in results {
-			let bytes = res?.expect("key should exist");
+			let bytes = res?.ok_or_else(|| anyhow!("key should exist"))?;
 			let val = BenchValue::decode(&bytes)?;
 			black_box(val);
 		}
