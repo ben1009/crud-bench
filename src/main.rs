@@ -845,7 +845,8 @@ fn run(args: Args) -> Result<()> {
 				#[cfg(feature = "surrealdb")]
 				{
 					match runtime.block_on(async {
-						let client = storage::StorageClient::connect(&args.storage_endpoint).await?;
+						let client =
+							storage::StorageClient::connect(&args.storage_endpoint).await?;
 						client.store_result(&res).await
 					}) {
 						Ok(_) => {

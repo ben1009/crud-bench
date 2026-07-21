@@ -66,6 +66,8 @@ pub(crate) enum Database {
 	Surrealkv,
 	#[cfg(feature = "surrealmx")]
 	Surrealmx,
+	#[cfg(feature = "toykv")]
+	Toykv,
 	/// SurrealDS - Multi-instance distributed SurrealDB benchmarking.
 	///
 	/// This option enables benchmarking against multiple SurrealDB instances simultaneously
@@ -546,6 +548,22 @@ impl Database {
 					)
 					.await
 			}
+			#[cfg(feature = "toykv")]
+			Database::Toykv => {
+				benchmark
+					.run::<_, DefaultDialect, _>(
+						crate::toykv::ToyKvClientProvider::setup(kt, vp.columns(), benchmark)
+							.await?,
+						kp,
+						vp,
+						scans,
+						batches,
+						database.clone(),
+						system.clone(),
+						metadata.clone(),
+					)
+					.await
+			}
 		}
 	}
 
@@ -591,6 +609,8 @@ impl Database {
 			Database::Surrealkv => "SurrealKV",
 			#[cfg(feature = "surrealmx")]
 			Database::Surrealmx => "SurrealMX",
+			#[cfg(feature = "toykv")]
+			Database::Toykv => "ToyKV",
 			#[cfg(feature = "surrealdb")]
 			Database::Surrealdb => "SurrealDB",
 			#[cfg(feature = "surrealdb2")]
