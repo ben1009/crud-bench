@@ -78,8 +78,8 @@ The MVP should implement these rows first:
 |---|---:|---|---|---|
 | `balanced_zipfian` | 50% read, 50% update | scrambled Zipfian, exponent 0.99 | prepared | Primary mixed read/write gate |
 | `point_read_zipfian` | 100% read | scrambled Zipfian, exponent 0.99 | prepared | Hot-key read throughput and latency |
-| `range_scan_uniform` | 100% scan | uniform start key | prepared | Bounded scan throughput and count validation |
-| `sustained_ingest` | 100% create/update append | unique sequential | empty or fresh | Steady durable write path |
+| `range_scan_uniform` | 100% scan | uniform positional start | prepared | Bounded scan throughput and count validation |
+| `sustained_ingest` | 100% create | unique sequential | fresh empty | Steady durable write path |
 
 Later rows:
 
@@ -92,6 +92,11 @@ Later rows:
 
 Backends that cannot support a row should report the row as skipped with a
 structured unsupported reason, not as a benchmark failure.
+
+The canonical operation names for steady-state rows are `create`, `read`,
+`update`, and `scan`. Adapter methods such as `read_*` and `update_*` map to
+those names directly. CLI `--operation-mix`, JSON `task.operation_mix`, and
+`validation.observed_mix` must use only canonical names.
 
 ## 6. Dataset Contract
 
@@ -111,14 +116,28 @@ methods so all embedded backends keep the same datastore surface. It still
 needs a new steady-state key-selection layer above the existing `KeyProvider`:
 the current providers can generate ordered or Feistel-scrambled keys, but they
 do not express Zipfian sampling, the Zipfian exponent, per-run seeds, or the
-recorded sampler contract. A later compatibility slice may add
-ToyKV-compatible fixed-width byte keys if cross-harness parity with
+recorded sampler contract. The runner must expose `--seed <u64>` with default
+`1`, serialize the effective seed in every steady-state row, and derive worker
+streams as `splitmix64(seed ^ worker_index)`. ToyKV and RocksDB rows in the
+same comparison must use the same effective seed. A later compatibility slice
+may add ToyKV-compatible fixed-width byte keys if cross-harness parity with
 `write-perf` requires it.
 
 Prepared datasets must be backend-local and disposable. The runner may create a
 fresh database per backend, bulk-load it, quiesce, and then run one or more
 steady-state rows against that prepared state. Copying or checkpointing a
 prepared database is optional and backend-specific.
+
+Each measured row must start from a defined dataset state:
+
+1. prepared rows use a freshly loaded or freshly cloned dataset containing keys
+   `0..records`;
+2. mixed update rows update only keys inside `0..records`;
+3. `sustained_ingest` starts from a fresh empty dataset and creates unique keys
+   from `0` upward for the duration of the measured window;
+4. if multiple rows run in one invocation, the runner must reset, reload, or
+   clone the required starting state before each row unless a row explicitly
+   opts into reuse.
 
 ## 7. Timing Model
 
@@ -135,6 +154,13 @@ The measured row duration is time-based, not fixed-count. Workers run
 closed-loop: each worker starts the next operation only after the previous
 operation returns. This keeps latency meaningful and avoids hiding backend
 queueing behind an unbounded client-side backlog.
+
+When `measurement_secs` expires in the middle of an operation-mix period,
+workers finish only the in-flight operation and stop before starting another.
+The measurement window may therefore contain a prefix of the deterministic
+period rather than an exact number of whole periods. Operation-mix validation
+must compare observed counts against the deterministic prefix implied by the
+actual completed operation count, not against a full-period ratio.
 
 ## 8. CLI
 
@@ -164,18 +190,19 @@ New options:
 --warmup-secs <n>
 --measurement-secs <n>
 --latency-sample-every <n>
+--seed <u64>                         default: 1
 --zipfian-exponent <f>             default: 0.99
---operation-mix <spec>             e.g. get=0.5,update=0.5
+--operation-mix <spec>             e.g. read=0.5,update=0.5
 --operation-mix-period <n>         default: 1000
 ```
 
 Preset defaults:
 
-| Preset | Records | Clients | Warmup | Measurement |
-|---|---:|---:|---:|---:|
-| `smoke` | 10,000 | 1 | 0s | 1s |
-| `default` | 1,000,000 | CLI/default clients | 30s | 120s |
-| `large` | CLI-controlled | CLI/default clients | 60s | 300s |
+| Preset | Records | Clients | Warmup | Measurement | Latency sample every |
+|---|---:|---:|---:|---:|---:|
+| `smoke` | 10,000 | 1 | 0s | 1s | 1 |
+| `default` | 1,000,000 | CLI/default clients | 30s | 120s | 100 |
+| `large` | CLI-controlled | CLI/default clients | 60s | 300s | 100 |
 
 Explicit CLI values override preset values.
 
@@ -196,6 +223,8 @@ Required JSON fields:
   "name": "balanced_zipfian",
   "suite": "steady-state",
   "database": "toykv",
+  "status": "completed",
+  "unsupported_reason": null,
   "sync": true,
   "task": {
     "records": 1000000,
@@ -203,10 +232,20 @@ Required JSON fields:
     "threads": 4,
     "warmup_secs": 30,
     "measurement_secs": 120,
-    "operation_mix": "get=0.5,update=0.5",
+    "latency_sample_every": 100,
+    "seed": 1,
+    "worker_seed_derivation": "splitmix64(seed ^ worker_index)",
+    "operation_mix": "read=0.5,update=0.5",
     "operation_mix_period": 1000,
     "key_selection": "scrambled_zipfian",
     "zipfian_exponent": 0.99
+  },
+  "phases": {
+    "prepare": { "elapsed_ms": 1000.0, "status": "completed" },
+    "warmup": { "elapsed_ms": 30000.0, "status": "completed" },
+    "measure": { "elapsed_ms": 120000.0, "status": "completed" },
+    "drain": { "elapsed_ms": 25.0, "status": "completed" },
+    "cleanup": { "elapsed_ms": 10.0, "status": "completed" }
   },
   "throughput": {
     "completed_operations": 123456,
@@ -225,7 +264,8 @@ Required JSON fields:
     "read_misses": 0,
     "updates": 61728,
     "scan_count_errors": 0,
-    "observed_mix": "get=0.500000,update=0.500000"
+    "observed_mix": "read=0.500000,update=0.500000",
+    "expected_mix_prefix": "read=61728,update=61728"
   },
   "drain": {
     "elapsed_ms": 25.0,
@@ -247,14 +287,21 @@ OPS = throughput.ops_per_sec
 Optional sidecar CSV columns:
 
 ```text
-suite,row,database,sync,completed_operations,validation_errors,
-drain_elapsed_ms,drain_timed_out,operation_mix,key_selection
+suite,row,database,status,unsupported_reason,sync,completed_operations,
+validation_errors,drain_elapsed_ms,drain_timed_out,operation_mix,key_selection
 ```
 
 Steady-state gate tools must read JSON or a required sidecar artifact for
 validation, drain, and unsupported-row state. The legacy CSV is retained for
 existing throughput and latency consumers only; it is not sufficient by itself
 to decide a steady-state gate.
+
+Allowed row statuses are `completed`, `unsupported`, and `failed`.
+Unsupported rows must set `status = "unsupported"` and a non-empty
+`unsupported_reason`. For unsupported rows, throughput, latency, validation,
+and drain fields may be absent or null, and gate tools must treat the row as
+skipped only when the gate marks that row optional. Failed rows must not be
+converted to unsupported rows.
 
 Gate tools must reject rows with:
 
@@ -318,6 +365,20 @@ once that row is added.
 
 `sustained_ingest` must validate that completed write count matches the
 reported operation count.
+
+`range_scan_uniform` uses a prepared keyspace with `records` keys and a fixed
+MVP scan width of `100`. For each operation, the selector chooses a positional
+start in `0..=(records - scan_width)`, then creates a `Scan` with
+`start = selected_start`, `limit = scan_width`, and `expect = scan_width`.
+This intentionally matches the current ToyKV and RocksDB adapter behavior,
+where `scan_bytes` and `do_scan` iterate in key order and apply `Scan::start`
+and `Scan::limit` positionally. The MVP must include a cross-adapter test with
+keys `0..255` and identical `Scan` inputs on ToyKV and RocksDB.
+
+For mixed rows, `observed_mix` is valid when it matches the deterministic
+prefix schedule for `completed_operations`. For example, a 50/50 mix with a
+1000-operation period may stop after 1234 operations; validation checks the
+first 1234 scheduled slots, not a rounded 617/617 split.
 
 ## 12. Gates
 
@@ -392,10 +453,9 @@ the accepted benchmark priority.
    in one benchmark invocation?
 2. Should latency samples be exact by default for short smoke rows and sampled
    by default for long rows?
-3. Should unsupported rows appear in CSV output, or only in JSON metadata?
-4. Should ToyKV checkpoint cloning become a generic adapter hook, or stay an
+3. Should ToyKV checkpoint cloning become a generic adapter hook, or stay an
    engine-specific optimization?
-5. Should a future scan-evidence API return keys for ordered/duplicate
+4. Should a future scan-evidence API return keys for ordered/duplicate
    validation, or should deeper scan correctness stay in backend-specific tests?
 
 ## 15. First Acceptance Target
@@ -411,6 +471,8 @@ cargo run --release --bin crud-bench -- \
   --bench balanced_zipfian \
   --database toykv \
   --samples 10000 \
+  --seed 1 \
+  --latency-sample-every 1 \
   --sync \
   --color never
 
@@ -421,6 +483,8 @@ cargo run --release --bin crud-bench -- \
   --bench balanced_zipfian \
   --database rocksdb \
   --samples 10000 \
+  --seed 1 \
+  --latency-sample-every 1 \
   --sync \
   --color never
 ```
