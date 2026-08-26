@@ -168,9 +168,11 @@ status, unsupported/failure reasons, validation counts, latency sample counts,
 drain state, and workload metadata. Use the JSON artifact as the `perf-gate`
 source for steady-state comparisons. Select rows with `--bench`; available
 steady-state rows are `balanced_zipfian`, `read_heavy_zipfian`,
-`update_heavy_zipfian`, `point_read_zipfian`, `point_read_missing_in_range`,
-`range_scan_uniform`, and `sustained_ingest`. Omitting `--bench` runs all seven
-default steady-state rows.
+`update_heavy_zipfian`, `point_read_zipfian`, `point_read_uniform`,
+`point_read_missing_in_range`, `range_scan_uniform`, and `sustained_ingest`.
+Omitting `--bench` runs all eight default steady-state rows.
+The optional `idle` row records phase and drain timing without client
+operations and is not included in the default OPS gate.
 
 For more detailed help information run the following command:
 
@@ -203,14 +205,15 @@ cargo run --release --bin perf-gate -- \
   --current-steady-state-json current-steady-state.json \
   --steady-state-row balanced_zipfian \
   --steady-state-row point_read_zipfian \
+  --steady-state-row point_read_uniform \
   --steady-state-row point_read_missing_in_range \
-  --optional-steady-state-row range_scan_uniform
+  --steady-state-row range_scan_uniform
 ```
 
 Omit `--steady-state-row` to gate the default steady-state rows:
 `balanced_zipfian`, `read_heavy_zipfian`, `update_heavy_zipfian`,
-`point_read_zipfian`, `point_read_missing_in_range`, `range_scan_uniform`, and
-`sustained_ingest`. Optional
+`point_read_zipfian`, `point_read_uniform`, `point_read_missing_in_range`,
+`range_scan_uniform`, and `sustained_ingest`. Optional
 steady-state rows are also evaluated, but `unsupported` is allowed for them
 when both artifacts are otherwise comparable.
 

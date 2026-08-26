@@ -45,6 +45,7 @@ const DEFAULT_STEADY_STATE_WORKLOADS: &[SteadyStateWorkload] = &[
 	SteadyStateWorkload::ReadHeavyZipfian,
 	SteadyStateWorkload::UpdateHeavyZipfian,
 	SteadyStateWorkload::PointReadZipfian,
+	SteadyStateWorkload::PointReadUniform,
 	SteadyStateWorkload::PointReadMissingInRange,
 	SteadyStateWorkload::RangeScanUniform,
 	SteadyStateWorkload::SustainedIngest,
@@ -863,6 +864,18 @@ impl Benchmark {
 		C: BenchmarkClient + Send + Sync,
 	{
 		let prepare_start = Instant::now();
+		if workload == SteadyStateWorkload::Idle {
+			return self
+				.run_steady_state_idle_row(
+					clients,
+					kp,
+					config,
+					workload,
+					database,
+					completed_phase(prepare_start.elapsed()),
+				)
+				.await;
+		}
 		if workload.requires_prepared_dataset() {
 			self.load_steady_state_dataset(clients, kp, vp.clone(), config.records).await?;
 		}
@@ -996,6 +1009,78 @@ impl Benchmark {
 				timed_out: false,
 			}),
 			operation_result: result,
+		})
+	}
+
+	async fn run_steady_state_idle_row<C>(
+		&self,
+		clients: &[Arc<C>],
+		kp: KeyProvider,
+		config: &SteadyStateConfig,
+		workload: SteadyStateWorkload,
+		database: Option<String>,
+		prepare: SteadyStatePhase,
+	) -> Result<SteadyStateResult>
+	where
+		C: BenchmarkClient + Send + Sync,
+	{
+		let warmup_start = Instant::now();
+		tokio::time::sleep(config.warmup).await;
+		let warmup = completed_phase(warmup_start.elapsed());
+		let measure_start = Instant::now();
+		tokio::time::sleep(config.measurement).await;
+		let measure = completed_phase(measure_start.elapsed());
+		let drain_start = Instant::now();
+		self.quiesce_and_mark().await;
+		let drain_elapsed = drain_start.elapsed();
+		let cleanup_start = Instant::now();
+		let cleanup_result =
+			self.reset_steady_state_row(clients, kp, config, workload, config.records as u64).await;
+		let cleanup_elapsed = cleanup_start.elapsed();
+		let (status, unsupported_reason, failure_reason) = match cleanup_result {
+			Ok(()) => (SteadyStateStatus::Completed, None, None),
+			Err(error) if error.to_string() == NOT_SUPPORTED_ERROR => {
+				(SteadyStateStatus::Unsupported, Some(NOT_SUPPORTED_ERROR.to_string()), None)
+			}
+			Err(error) => {
+				(SteadyStateStatus::Failed, None, Some(format!("cleanup failed: {error:#}")))
+			}
+		};
+		Ok(SteadyStateResult {
+			name: workload.name().to_string(),
+			suite: "steady-state",
+			database,
+			status,
+			unsupported_reason,
+			failure_reason,
+			sync: self.sync,
+			task: workload.task(self, config),
+			phases: SteadyStatePhases {
+				prepare,
+				warmup,
+				measure,
+				drain: completed_phase(drain_elapsed),
+				cleanup: SteadyStatePhase {
+					elapsed_ms: cleanup_elapsed.as_secs_f64() * 1000.0,
+					status,
+				},
+			},
+			throughput: None,
+			latency: None,
+			validation: Some(SteadyStateValidation {
+				errors: 0,
+				read_hits: 0,
+				read_misses: 0,
+				updates: 0,
+				scan_count_errors: 0,
+				observed_mix: "none".to_string(),
+				expected_mix_prefix: "none".to_string(),
+			}),
+			drain: Some(SteadyStateDrain {
+				elapsed_ms: drain_elapsed.as_secs_f64() * 1000.0,
+				timed_out: false,
+			}),
+			operation_result: None,
 		})
 	}
 
@@ -1722,9 +1807,11 @@ enum SteadyStateWorkload {
 	ReadHeavyZipfian,
 	UpdateHeavyZipfian,
 	PointReadZipfian,
+	PointReadUniform,
 	PointReadMissingInRange,
 	RangeScanUniform,
 	SustainedIngest,
+	Idle,
 }
 
 impl SteadyStateWorkload {
@@ -1734,9 +1821,11 @@ impl SteadyStateWorkload {
 			Self::ReadHeavyZipfian => "read_heavy_zipfian",
 			Self::UpdateHeavyZipfian => "update_heavy_zipfian",
 			Self::PointReadZipfian => "point_read_zipfian",
+			Self::PointReadUniform => "point_read_uniform",
 			Self::PointReadMissingInRange => "point_read_missing_in_range",
 			Self::RangeScanUniform => "range_scan_uniform",
 			Self::SustainedIngest => "sustained_ingest",
+			Self::Idle => "idle",
 		}
 	}
 
@@ -1746,9 +1835,11 @@ impl SteadyStateWorkload {
 			"read_heavy_zipfian" => Ok(Self::ReadHeavyZipfian),
 			"update_heavy_zipfian" => Ok(Self::UpdateHeavyZipfian),
 			"point_read_zipfian" => Ok(Self::PointReadZipfian),
+			"point_read_uniform" => Ok(Self::PointReadUniform),
 			"point_read_missing_in_range" => Ok(Self::PointReadMissingInRange),
 			"range_scan_uniform" => Ok(Self::RangeScanUniform),
 			"sustained_ingest" => Ok(Self::SustainedIngest),
+			"idle" => Ok(Self::Idle),
 			other => bail!("unsupported steady-state workload `{other}`"),
 		}
 	}
@@ -1790,9 +1881,11 @@ impl SteadyStateWorkload {
 				}
 			}
 			Self::PointReadZipfian => SteadyStateOperation::Read,
+			Self::PointReadUniform => SteadyStateOperation::Read,
 			Self::PointReadMissingInRange => SteadyStateOperation::Read,
 			Self::RangeScanUniform => SteadyStateOperation::Scan,
 			Self::SustainedIngest => SteadyStateOperation::Create,
+			Self::Idle => unreachable!("idle workloads do not execute client operations"),
 		}
 	}
 
@@ -1805,17 +1898,21 @@ impl SteadyStateWorkload {
 			Self::ReadHeavyZipfian => "read=0.95,update=0.05".to_string(),
 			Self::UpdateHeavyZipfian => "read=0.05,update=0.95".to_string(),
 			Self::PointReadZipfian => "read=1.0".to_string(),
+			Self::PointReadUniform => "read=1.0".to_string(),
 			Self::PointReadMissingInRange => "read=1.0".to_string(),
 			Self::RangeScanUniform => "scan=1.0".to_string(),
 			Self::SustainedIngest => "create=1.0".to_string(),
+			Self::Idle => "none".to_string(),
 		}
 	}
 
 	fn key_selection(self) -> &'static str {
 		match self {
+			Self::PointReadUniform => "uniform",
 			Self::PointReadMissingInRange => "scrambled_zipfian_missing_range",
 			Self::RangeScanUniform => "uniform_positional",
 			Self::SustainedIngest => "unique_sequential",
+			Self::Idle => "none",
 			_ => "scrambled_zipfian",
 		}
 	}
@@ -1831,12 +1928,14 @@ impl SteadyStateWorkload {
 			Self::BalancedZipfian
 			| Self::ReadHeavyZipfian
 			| Self::UpdateHeavyZipfian
-			| Self::PointReadZipfian => schedule
+			| Self::PointReadZipfian
+			| Self::PointReadUniform => schedule
 				.iter()
 				.all(|op| matches!(op, SteadyStateOperation::Read | SteadyStateOperation::Update)),
 			Self::PointReadMissingInRange => {
 				schedule.iter().all(|op| matches!(op, SteadyStateOperation::Read))
 			}
+			Self::Idle => false,
 		};
 		if !valid {
 			bail!(
@@ -1865,6 +1964,9 @@ impl SteadyStateWorkload {
 	}
 
 	fn expected_mix_prefix(self, config: &SteadyStateConfig, completed: u64) -> String {
+		if self == SteadyStateWorkload::Idle {
+			return "none".to_string();
+		}
 		let mut counts = SteadyStateCounts::default();
 		let period = config
 			.operation_schedule
@@ -2082,7 +2184,14 @@ impl KeySelector {
 		if upper == 0 {
 			return 0;
 		}
-		(self.next_u64() % upper as u64) as u32
+		let upper = upper as u64;
+		let threshold = upper.wrapping_neg() % upper;
+		loop {
+			let value = self.next_u64();
+			if value >= threshold {
+				return (value % upper) as u32;
+			}
+		}
 	}
 
 	fn uniform_f64(&mut self) -> f64 {
@@ -2358,6 +2467,7 @@ mod steady_state_tests {
 				"read_heavy_zipfian",
 				"update_heavy_zipfian",
 				"point_read_zipfian",
+				"point_read_uniform",
 				"point_read_missing_in_range",
 				"range_scan_uniform",
 				"sustained_ingest"
@@ -2436,11 +2546,35 @@ mod steady_state_tests {
 
 		let read_heavy = KeySelector::new(&config, SteadyStateWorkload::ReadHeavyZipfian, 0);
 		let update_heavy = KeySelector::new(&config, SteadyStateWorkload::UpdateHeavyZipfian, 0);
+		let uniform = KeySelector::new(&config, SteadyStateWorkload::PointReadUniform, 0);
 
 		assert!(!read_heavy.zipf_cdf.is_empty());
 		assert!(!update_heavy.zipf_cdf.is_empty());
 		assert!(!read_heavy.scrambled_keys.is_empty());
+		assert!(uniform.zipf_cdf.is_empty());
+		assert!(uniform.scrambled_keys.is_empty());
 		assert_ne!(read_heavy.scrambled_keys[0], 0);
+	}
+
+	#[test]
+	fn uniform_selector_stays_within_bounds() {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: None,
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 1000,
+		};
+		let mut selector = KeySelector::new(&config, SteadyStateWorkload::PointReadUniform, 0);
+
+		for _ in 0..10_000 {
+			assert!(selector.uniform_u32(37) < 37);
+		}
 	}
 
 	#[test]

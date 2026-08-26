@@ -80,6 +80,7 @@ The MVP should implement these rows first:
 | `read_heavy_zipfian` | 95% read, 5% update | scrambled Zipfian, exponent 0.99 | prepared | Cache-heavy churn |
 | `update_heavy_zipfian` | 5% read, 95% update | scrambled Zipfian, exponent 0.99 | prepared | Write-heavy churn |
 | `point_read_zipfian` | 100% read | scrambled Zipfian, exponent 0.99 | prepared | Hot-key read throughput and latency |
+| `point_read_uniform` | 100% read | uniform positional key selection | prepared | Uniform point-read throughput and latency |
 | `point_read_missing_in_range` | 100% missing read | scrambled Zipfian missing-range | prepared | Negative lookup behavior |
 | `range_scan_uniform` | 100% scan | uniform positional start | prepared | Bounded scan throughput and count validation |
 | `sustained_ingest` | 100% create | unique sequential | fresh empty | Steady durable write path |
@@ -88,6 +89,7 @@ Later rows:
 
 | Row | Operation mix | Purpose |
 |---|---:|---|
+| `idle` | no client operations | Background phase and drain timing |
 | `transaction_contention` | parameterized | Serializable transaction contention, only after the adapter API supports it |
 
 Backends that cannot support a row should report the row as skipped with a
@@ -396,9 +398,10 @@ The current default ToyKV vs RocksDB steady-state gate compares:
 2. `read_heavy_zipfian`;
 3. `update_heavy_zipfian`;
 4. `point_read_zipfian`;
-5. `point_read_missing_in_range`;
-6. `range_scan_uniform`;
-7. `sustained_ingest`.
+5. `point_read_uniform`;
+6. `point_read_missing_in_range`;
+7. `range_scan_uniform`;
+8. `sustained_ingest`.
 
 Acceptance for a ToyKV storage-engine performance PR:
 
@@ -436,11 +439,12 @@ the accepted benchmark priority.
 
 ### Phase 3: MVP Workloads
 
-1. Implement `point_read_zipfian`.
+1. Implement `point_read_zipfian`. Done in this implementation.
 2. Implement `balanced_zipfian`.
 3. Implement `range_scan_uniform`.
 4. Implement `sustained_ingest`.
-5. Add validation for each row.
+5. Implement `point_read_uniform`. Done in this implementation.
+6. Add validation for each row.
 
 ### Phase 4: Comparison And Gate Tooling
 
