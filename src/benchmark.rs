@@ -864,15 +864,22 @@ impl Benchmark {
 		C: BenchmarkClient + Send + Sync,
 	{
 		let prepare_start = Instant::now();
+		if workload == SteadyStateWorkload::Idle {
+			return self
+				.run_steady_state_idle_row(
+					clients,
+					kp,
+					config,
+					workload,
+					database,
+					completed_phase(prepare_start.elapsed()),
+				)
+				.await;
+		}
 		if workload.requires_prepared_dataset() {
 			self.load_steady_state_dataset(clients, kp, vp.clone(), config.records).await?;
 		}
 		let prepare = completed_phase(prepare_start.elapsed());
-		if workload == SteadyStateWorkload::Idle {
-			return self
-				.run_steady_state_idle_row(clients, kp, config, workload, database, prepare)
-				.await;
-		}
 		let mut next_op_index = 0;
 
 		let warmup_start = Instant::now();
