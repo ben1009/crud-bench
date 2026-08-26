@@ -2,6 +2,7 @@
 
 use crate::benchmark::NOT_SUPPORTED_ERROR;
 use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
+use crate::keyprovider::{IntegerKeyProvider, KeyProvider, StringKeyProvider};
 use crate::value::BenchValue;
 use crate::valueprovider::Columns;
 use crate::{Benchmark, KeyType, Projection, Scan};
@@ -14,6 +15,7 @@ use toykv::lsm_storage::{KvEngine, LsmStorageOptions, WriteBatchRecord};
 use toykv::vlog::ValueSeparationOptions;
 
 const DATABASE_DIR: &str = "toykv_data";
+const STEADY_STATE_RESET_BATCH_SIZE: usize = 1_000;
 
 fn env_flag(name: &str) -> bool {
 	std::env::var(name).is_ok()
@@ -100,6 +102,28 @@ impl BenchmarkClient for ToyKvClient {
 		self.engine.close()?;
 		if !self.reads_only && !self.preserve_db {
 			std::fs::remove_dir_all(DATABASE_DIR).ok();
+		}
+		Ok(())
+	}
+
+	async fn reset_steady_state(&self, upper: u32, kp: &mut KeyProvider) -> Result<()> {
+		if self.reads_only || self.load_only {
+			bail!(NOT_SUPPORTED_ERROR);
+		}
+		let batch: Vec<WriteBatchRecord<Vec<u8>>> = (0..upper)
+			.map(|n| match kp {
+				KeyProvider::OrderedInteger(p) => {
+					WriteBatchRecord::Del(p.key(n).to_ne_bytes().to_vec())
+				}
+				KeyProvider::UnorderedInteger(p) => {
+					WriteBatchRecord::Del(p.key(n).to_ne_bytes().to_vec())
+				}
+				KeyProvider::OrderedString(p) => WriteBatchRecord::Del(p.key(n).into_bytes()),
+				KeyProvider::UnorderedString(p) => WriteBatchRecord::Del(p.key(n).into_bytes()),
+			})
+			.collect();
+		for chunk in batch.chunks(STEADY_STATE_RESET_BATCH_SIZE) {
+			self.engine.write_batch(chunk)?;
 		}
 		Ok(())
 	}

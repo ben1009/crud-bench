@@ -57,6 +57,11 @@ pub(crate) trait BenchmarkClient: Sync + Send + 'static {
 		Ok(())
 	}
 
+	/// Best-effort removal of steady-state benchmark keys in `[0, upper)`.
+	async fn reset_steady_state(&self, _upper: u32, _kp: &mut KeyProvider) -> Result<()> {
+		bail!(NOT_SUPPORTED_ERROR)
+	}
+
 	/// Create a single entry with the current client
 	fn create(
 		&self,

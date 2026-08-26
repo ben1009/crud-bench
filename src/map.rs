@@ -1,5 +1,6 @@
 use crate::benchmark::NOT_SUPPORTED_ERROR;
 use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
+use crate::keyprovider::{IntegerKeyProvider, KeyProvider, StringKeyProvider};
 use crate::value::BenchValue;
 use crate::valueprovider::Columns;
 use crate::{Benchmark, KeyType, Projection, Scan};
@@ -50,6 +51,42 @@ pub(crate) struct MapClient(MapDatabase);
 impl BenchmarkClient for MapClient {
 	// The return type when reading a row
 	type ReadRow = BenchValue;
+
+	async fn reset_steady_state(&self, upper: u32, kp: &mut KeyProvider) -> Result<()> {
+		let integer_keys =
+			matches!(kp, KeyProvider::OrderedInteger(_) | KeyProvider::UnorderedInteger(_));
+		let string_keys =
+			matches!(kp, KeyProvider::OrderedString(_) | KeyProvider::UnorderedString(_));
+		match &self.0 {
+			MapDatabase::Integer(m) => {
+				if !integer_keys {
+					bail!("Invalid KeyProvider variant");
+				}
+				for n in 0..upper {
+					let key = match kp {
+						KeyProvider::OrderedInteger(p) => p.key(n),
+						KeyProvider::UnorderedInteger(p) => p.key(n),
+						_ => unreachable!("key provider variant validated above"),
+					};
+					m.remove(&key);
+				}
+			}
+			MapDatabase::String(m) => {
+				if !string_keys {
+					bail!("Invalid KeyProvider variant");
+				}
+				for n in 0..upper {
+					let key = match kp {
+						KeyProvider::OrderedString(p) => p.key(n),
+						KeyProvider::UnorderedString(p) => p.key(n),
+						_ => unreachable!("key provider variant validated above"),
+					};
+					m.remove(&key);
+				}
+			}
+		}
+		Ok(())
+	}
 
 	async fn create_u32(&self, key: u32, val: BenchValue) -> Result<()> {
 		if let MapDatabase::Integer(m) = &self.0 {

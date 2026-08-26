@@ -4210,6 +4210,7 @@ dependencies = [
  "ouroboros",
  "parking_lot",
  "rand 0.8.6",
+ "rand_chacha 0.3.1",
  "rustyline",
  "serde",
  "serde_json",

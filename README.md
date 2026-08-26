@@ -105,7 +105,7 @@ and lists those which are planned in the future.
 
 **Workloads**
 
-- [ ] Workload support for creating, updating, and reading records concurrently
+- [x] Steady-state workload support for concurrent reads, updates, range scans, and sustained ingest
 
 ## Requirements
 
@@ -123,7 +123,7 @@ cargo run -r -- -h
 Usage: crud-bench [OPTIONS] --database <DATABASE> --samples <SAMPLES>
 
 Options:
-  -n, --name <NAME>                            An optional name for the test, used as a suffix for the JSON result file name
+  -n, --name <NAME>                            An optional name for result artifacts (`result-<name>.json`, `result-<name>.csv`, `result-<name>.html`, and steady-state sidecar CSV when applicable)
   -d, --database <DATABASE>                    The database to benchmark [possible values: dry, map, arangodb, dragonfly, fjall, keydb, mdbx, lmdb, mariadb, mongodb, mysql, neo4j, postgres, redb, redis, rocksdb, scylladb, slatedb, sqlite, surrealdb, surrealkv, surrealmx, surrealds]
   -i, --image <IMAGE>                          Specify a custom Docker image
   -p, --privileged                             Whether to run Docker in privileged mode
@@ -149,8 +149,28 @@ Options:
       --skip-batches                           Skip all batch benchmarks
       --skip-indexes                           Skip index operations, but still table scan queries
       --emit-phase-markers                     Emit line-oriented phase markers (`… starting`, `Benchmark starting`) for log-based tooling (e.g. `dev.sh` perf windows). Off by default; also on when `CRUD_BENCH_EMIT_PHASE_MARKERS` is `1`, `true`, `yes`, or `on`
+      --suite <SUITE>                          Benchmark suite to run [default: crud] [possible values: crud, steady-state]
+      --bench <BENCH>                          Comma-separated steady-state workload names
+      --preset <PRESET>                        Steady-state scale preset [default: default] [possible values: smoke, default, large]
+      --warmup-secs <WARMUP_SECS>              Override steady-state warmup duration in seconds
+      --measurement-secs <MEASUREMENT_SECS>    Override steady-state measurement duration in seconds
+      --latency-sample-every <N>               Record one steady-state latency sample every N completed operations
+      --seed <SEED>                            Steady-state deterministic key-selection seed
+      --zipfian-exponent <ZIPFIAN_EXPONENT>    Steady-state Zipfian exponent
+      --operation-mix <OPERATION_MIX>          Custom steady-state operation mix, for example `read=0.5,update=0.5`
+      --operation-mix-period <N>               Custom operation mix period
   -h, --help                                   Print help (see more with '--help')
   ```
+
+Steady-state runs write the normal JSON, CSV, and HTML artifacts. They also
+write `result-<name>-steady-state.csv` (or `result-steady-state.csv`) with row
+status, unsupported/failure reasons, validation counts, latency sample counts,
+drain state, and workload metadata. Use the JSON artifact as the `perf-gate`
+source for steady-state comparisons. Select rows with `--bench`; available
+steady-state rows are `balanced_zipfian`, `read_heavy_zipfian`,
+`update_heavy_zipfian`, `point_read_zipfian`, `point_read_missing_in_range`,
+`range_scan_uniform`, and `sustained_ingest`. Omitting `--bench` runs all seven
+default steady-state rows.
 
 For more detailed help information run the following command:
 
@@ -174,6 +194,25 @@ cargo run --release --bin perf-gate -- \
 
 Add `--baseline-latency-sync` and `--current-latency-sync` with single-client
 sync CSVs to enforce the p95/p99 latency gate.
+
+Use steady-state JSON artifacts for steady-state gates:
+
+```bash
+cargo run --release --bin perf-gate -- \
+  --baseline-steady-state-json baseline-steady-state.json \
+  --current-steady-state-json current-steady-state.json \
+  --steady-state-row balanced_zipfian \
+  --steady-state-row point_read_zipfian \
+  --steady-state-row point_read_missing_in_range \
+  --optional-steady-state-row range_scan_uniform
+```
+
+Omit `--steady-state-row` to gate the default steady-state rows:
+`balanced_zipfian`, `read_heavy_zipfian`, `update_heavy_zipfian`,
+`point_read_zipfian`, `point_read_missing_in_range`, `range_scan_uniform`, and
+`sustained_ingest`. Optional
+steady-state rows are also evaluated, but `unsupported` is allowed for them
+when both artifacts are otherwise comparable.
 
 ### Comparing `result*.json` files in the browser
 

@@ -58,6 +58,9 @@ pub(crate) struct BenchmarkResult {
 	pub(crate) updates: Option<OperationResult>,
 	/// One entry per configured scan id (possibly multiple timed legs inside [`ScanResult::runs`]).
 	pub(crate) scans: Vec<ScanResult>,
+	/// Time-windowed steady-state rows.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub(crate) steady_state: Vec<SteadyStateResult>,
 	/// `(batch_case_name, timed_iterations, records_per_batch, histogram_metrics_or_skip)`.
 	pub(crate) batches: Vec<(String, u32, usize, Option<OperationResult>)>,
 	/// Single-record delete phase.
@@ -65,6 +68,112 @@ pub(crate) struct BenchmarkResult {
 	/// Example document produced by the value template (for inspection / stored results).
 	#[serde(serialize_with = "serialize_sample")]
 	pub(crate) sample: BenchValue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
+pub(crate) enum SteadyStateStatus {
+	Completed,
+	Unsupported,
+	Failed,
+}
+
+impl SteadyStateStatus {
+	pub(crate) fn as_str(self) -> &'static str {
+		match self {
+			Self::Completed => "completed",
+			Self::Unsupported => "unsupported",
+			Self::Failed => "failed",
+		}
+	}
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SteadyStateTask {
+	pub(crate) records: u32,
+	pub(crate) clients: u32,
+	pub(crate) threads: u32,
+	pub(crate) warmup_secs: u64,
+	pub(crate) measurement_secs: u64,
+	pub(crate) latency_sample_every: u64,
+	pub(crate) seed: u64,
+	pub(crate) worker_seed_derivation: &'static str,
+	pub(crate) operation_mix: String,
+	pub(crate) operation_mix_period: u32,
+	pub(crate) key_selection: &'static str,
+	pub(crate) zipfian_exponent: f64,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SteadyStatePhase {
+	pub(crate) elapsed_ms: f64,
+	pub(crate) status: SteadyStateStatus,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SteadyStatePhases {
+	pub(crate) prepare: SteadyStatePhase,
+	pub(crate) warmup: SteadyStatePhase,
+	pub(crate) measure: SteadyStatePhase,
+	pub(crate) drain: SteadyStatePhase,
+	pub(crate) cleanup: SteadyStatePhase,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SteadyStateThroughput {
+	pub(crate) completed_operations: u64,
+	pub(crate) ops_per_sec: f64,
+	pub(crate) per_second_windows: Vec<f64>,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SteadyStateLatency {
+	pub(crate) sample_count: u64,
+	pub(crate) p50_ms: f64,
+	pub(crate) p95_ms: f64,
+	pub(crate) p99_ms: f64,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SteadyStateValidation {
+	pub(crate) errors: u64,
+	pub(crate) read_hits: u64,
+	pub(crate) read_misses: u64,
+	pub(crate) updates: u64,
+	pub(crate) scan_count_errors: u64,
+	pub(crate) observed_mix: String,
+	pub(crate) expected_mix_prefix: String,
+}
+
+#[derive(Clone, Serialize)]
+pub(crate) struct SteadyStateDrain {
+	pub(crate) elapsed_ms: f64,
+	pub(crate) timed_out: bool,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SteadyStateResult {
+	pub(crate) name: String,
+	pub(crate) suite: &'static str,
+	pub(crate) database: Option<String>,
+	pub(crate) status: SteadyStateStatus,
+	pub(crate) unsupported_reason: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) failure_reason: Option<String>,
+	pub(crate) sync: bool,
+	pub(crate) task: SteadyStateTask,
+	pub(crate) phases: SteadyStatePhases,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) throughput: Option<SteadyStateThroughput>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) latency: Option<SteadyStateLatency>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) validation: Option<SteadyStateValidation>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) drain: Option<SteadyStateDrain>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub(crate) operation_result: Option<OperationResult>,
 }
 
 /// Serialise a [`BenchValue`] through its JSON adapter so JSON consumers see the
@@ -283,6 +392,18 @@ impl Display for BenchmarkResult {
 				table.add_row(cells);
 			}
 		}
+		for row in &self.steady_state {
+			let label = format!("[T]steady-state::{}", row.name);
+			if row.status == SteadyStateStatus::Completed
+				&& let Some(res) = &row.operation_result
+			{
+				table.add_row(res.output(label));
+			} else {
+				let mut cells = vec![label];
+				cells.extend(SKIP.iter().map(|s| s.to_string()));
+				table.add_row(cells);
+			}
+		}
 		// Right align the `CPU` column
 		let column = table.column_mut(8).expect("The table needs at least 9 columns");
 		column.set_cell_alignment(CellAlignment::Right);
@@ -376,7 +497,74 @@ impl BenchmarkResult {
 				w.write_record(cells)?;
 			}
 		}
+		for row in &self.steady_state {
+			let label = format!("[T]steady-state::{}", row.name);
+			if row.status == SteadyStateStatus::Completed
+				&& let Some(res) = &row.operation_result
+			{
+				w.write_record(res.output_csv(label))?;
+			} else {
+				let mut cells = vec![label];
+				cells.extend(CSV_SKIP.iter().map(|s| s.to_string()));
+				w.write_record(cells)?;
+			}
+		}
 		// Ensure all data is flushed to the file
+		w.flush()?;
+		Ok(())
+	}
+
+	pub(crate) fn to_steady_state_sidecar_csv(&self, path: &str) -> Result<(), csv::Error> {
+		let mut w = Writer::from_path(path)?;
+		w.write_record([
+			"suite",
+			"row",
+			"database",
+			"status",
+			"unsupported_reason",
+			"failure_reason",
+			"sync",
+			"completed_operations",
+			"validation_errors",
+			"latency_sample_count",
+			"latency_sample_every",
+			"drain_elapsed_ms",
+			"drain_timed_out",
+			"operation_mix",
+			"key_selection",
+		])?;
+		for row in &self.steady_state {
+			let completed = row
+				.throughput
+				.as_ref()
+				.map(|t| t.completed_operations.to_string())
+				.unwrap_or_default();
+			let validation_errors =
+				row.validation.as_ref().map(|v| v.errors.to_string()).unwrap_or_default();
+			let latency_sample_count =
+				row.latency.as_ref().map(|l| l.sample_count.to_string()).unwrap_or_default();
+			let drain_elapsed =
+				row.drain.as_ref().map(|d| format!("{:.3}", d.elapsed_ms)).unwrap_or_default();
+			let drain_timed_out =
+				row.drain.as_ref().map(|d| d.timed_out.to_string()).unwrap_or_default();
+			w.write_record([
+				row.suite.to_string(),
+				row.name.clone(),
+				row.database.clone().unwrap_or_default(),
+				row.status.as_str().to_string(),
+				row.unsupported_reason.clone().unwrap_or_default(),
+				row.failure_reason.clone().unwrap_or_default(),
+				row.sync.to_string(),
+				completed,
+				validation_errors,
+				latency_sample_count,
+				row.task.latency_sample_every.to_string(),
+				drain_elapsed,
+				drain_timed_out,
+				row.task.operation_mix.clone(),
+				row.task.key_selection.to_string(),
+			])?;
+		}
 		w.flush()?;
 		Ok(())
 	}
@@ -481,13 +669,13 @@ impl StatsCollector {
 }
 
 /// Live [`sysinfo`] handle plus background polling used to build an [`OperationResult`].
-pub(super) struct OperationMetric {
+pub(crate) struct OperationMetric {
 	/// Shared system state for synchronous refresh calls.
 	system: System,
 	/// Process under test (benchmark worker or explicit `--pid`).
 	pid: Pid,
 	/// Logical operation count for OPS calculation.
-	samples: u32,
+	samples: u64,
 	/// Wall-clock start for elapsed time.
 	start_time: Instant,
 	/// Disk counters before the phase (subtracted for delta I/O).
@@ -502,7 +690,7 @@ pub(super) struct OperationMetric {
 
 impl OperationMetric {
 	/// Starts periodic polling for the given PID (defaults to current process).
-	pub(super) fn new(pid: Option<u32>, samples: u32) -> Self {
+	pub(crate) fn new(pid: Option<u32>, samples: u64) -> Self {
 		// We collect the PID
 		let pid = Pid::from(pid.unwrap_or_else(process::id) as usize);
 		let refresh_kind = ProcessRefreshKind::nothing().with_memory().with_cpu().with_disk_usage();
@@ -539,6 +727,10 @@ impl OperationMetric {
 		metric.monitor_handle = Some(monitor_handle);
 
 		metric
+	}
+
+	pub(crate) fn set_samples(&mut self, samples: u64) {
+		self.samples = samples;
 	}
 
 	/// Refreshes and returns the watched [`Process`], if still alive.
@@ -620,7 +812,7 @@ pub(crate) struct OperationResult {
 	/// Wall-clock duration of the whole phase.
 	elapsed: Duration,
 	/// Number of logical iterations aggregated into `histogram`.
-	samples: u32,
+	samples: u64,
 	/// Snapshot CPU at end of phase (normalised by core count).
 	cpu_usage: f32,
 	/// Min / max / avg from polled samples when available.
