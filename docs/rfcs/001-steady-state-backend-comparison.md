@@ -447,7 +447,8 @@ the accepted benchmark priority.
 1. Run ToyKV and RocksDB smoke rows.
 2. Add `perf-gate` support for steady-state JSON rows. Keep legacy CSV parsing
    for existing OPS/p95/p99 comparisons only.
-3. Document the ToyKV vs RocksDB command shape.
+3. Document the ToyKV vs RocksDB command shape, including the explicit
+   `--allow-database-mismatch` gate option.
 4. Defer publishing resulting artifact names in the ToyKV benchmark report to
    the first ToyKV-side report update that consumes these crud-bench artifacts.
 

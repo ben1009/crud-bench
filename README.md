@@ -201,6 +201,7 @@ Use steady-state JSON artifacts for steady-state gates:
 cargo run --release --bin perf-gate -- \
   --baseline-steady-state-json baseline-steady-state.json \
   --current-steady-state-json current-steady-state.json \
+  --allow-database-mismatch \
   --steady-state-row balanced_zipfian \
   --steady-state-row point_read_zipfian \
   --steady-state-row point_read_missing_in_range \
@@ -213,6 +214,10 @@ Omit `--steady-state-row` to gate the default steady-state rows:
 `sustained_ingest`. Optional
 steady-state rows are also evaluated, but `unsupported` is allowed for them
 when both artifacts are otherwise comparable.
+
+Use `--allow-database-mismatch` when the baseline and current artifacts are
+different backends, such as a ToyKV-versus-RocksDB comparison. The gate still
+requires matching task metadata and sync settings.
 
 ### Comparing `result*.json` files in the browser
 
