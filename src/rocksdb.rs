@@ -2,6 +2,7 @@
 
 use crate::benchmark::NOT_SUPPORTED_ERROR;
 use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
+use crate::keyprovider::{IntegerKeyProvider, KeyProvider, StringKeyProvider};
 use crate::memory::Config;
 use crate::value::BenchValue;
 use crate::valueprovider::Columns;
@@ -206,6 +207,30 @@ impl BenchmarkClient for RocksDBClient {
 		// Wait for compaction to complete
 		self.db.wait_for_compact(&opts)?;
 		// Ok
+		Ok(())
+	}
+
+	async fn reset_steady_state(&self, upper: u32, kp: &mut KeyProvider) -> Result<()> {
+		for n in 0..upper {
+			match kp {
+				KeyProvider::OrderedInteger(p) => {
+					let key = p.key(n).to_ne_bytes();
+					self.delete_bytes(&key).await?;
+				}
+				KeyProvider::UnorderedInteger(p) => {
+					let key = p.key(n).to_ne_bytes();
+					self.delete_bytes(&key).await?;
+				}
+				KeyProvider::OrderedString(p) => {
+					let key = p.key(n).into_bytes();
+					self.delete_bytes(&key).await?;
+				}
+				KeyProvider::UnorderedString(p) => {
+					let key = p.key(n).into_bytes();
+					self.delete_bytes(&key).await?;
+				}
+			}
+		}
 		Ok(())
 	}
 

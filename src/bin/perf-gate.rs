@@ -6,10 +6,20 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use serde::Deserialize;
 
 const DEFAULT_ROWS: &[&str] =
 	&["put_c", "batch_create_100", "batch_create_1000", "batch_delete_100", "batch_delete_1000"];
 const DEFAULT_RATIO_ROWS: &[&str] = &["put_c", "batch_create_1000", "batch_delete_1000"];
+const DEFAULT_STEADY_STATE_ROWS: &[&str] = &[
+	"balanced_zipfian",
+	"read_heavy_zipfian",
+	"update_heavy_zipfian",
+	"point_read_zipfian",
+	"point_read_missing_in_range",
+	"range_scan_uniform",
+	"sustained_ingest",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "perf-gate")]
@@ -17,16 +27,28 @@ const DEFAULT_RATIO_ROWS: &[&str] = &["put_c", "batch_create_1000", "batch_delet
 struct Args {
 	/// Previous ToyKV --sync crud-bench CSV.
 	#[arg(long)]
-	baseline_sync: PathBuf,
+	baseline_sync: Option<PathBuf>,
 	/// Current ToyKV --sync crud-bench CSV.
 	#[arg(long)]
-	current_sync: PathBuf,
+	current_sync: Option<PathBuf>,
 	/// Previous ToyKV no-sync crud-bench CSV.
 	#[arg(long)]
-	baseline_nosync: PathBuf,
+	baseline_nosync: Option<PathBuf>,
 	/// Current ToyKV no-sync crud-bench CSV.
 	#[arg(long)]
-	current_nosync: PathBuf,
+	current_nosync: Option<PathBuf>,
+	/// Previous steady-state JSON artifact.
+	#[arg(long)]
+	baseline_steady_state_json: Option<PathBuf>,
+	/// Current steady-state JSON artifact.
+	#[arg(long)]
+	current_steady_state_json: Option<PathBuf>,
+	/// Required steady-state row. Defaults to the RFC MVP rows in steady-state mode.
+	#[arg(long = "steady-state-row")]
+	steady_state_rows: Vec<String>,
+	/// Optional steady-state row; unsupported rows with these names are skipped.
+	#[arg(long = "optional-steady-state-row")]
+	optional_steady_state_rows: Vec<String>,
 	/// Current Fjall --sync crud-bench CSV. When present, ToyKV must stay at or above Fjall on
 	/// gated rows.
 	#[arg(long)]
@@ -82,15 +104,166 @@ struct GateInputs {
 	current_latency_sync: Option<BenchCsv>,
 }
 
+#[derive(Debug)]
+struct SteadyStateGateConfig {
+	rows: Vec<String>,
+	optional_rows: Vec<String>,
+	max_ops_regression_pct: f64,
+	max_latency_regression_pct: f64,
+}
+
+#[derive(Debug)]
+struct SteadyStateGateInputs {
+	baseline: SteadyStateRows,
+	current: SteadyStateRows,
+}
+
 struct Evaluation {
 	report: String,
 	passed: bool,
 }
 
 type BenchCsv = HashMap<String, BenchRow>;
+type SteadyStateRows = HashMap<String, SteadyStateRow>;
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStateArtifact {
+	#[serde(default)]
+	steady_state: Vec<SteadyStateRow>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStateRow {
+	name: String,
+	suite: String,
+	database: serde_json::Value,
+	status: String,
+	#[serde(default)]
+	unsupported_reason: Option<String>,
+	#[serde(default)]
+	failure_reason: Option<String>,
+	sync: bool,
+	task: SteadyStateTask,
+	phases: SteadyStatePhases,
+	#[serde(default)]
+	throughput: Option<SteadyStateThroughput>,
+	#[serde(default)]
+	latency: Option<SteadyStateLatency>,
+	#[serde(default)]
+	validation: Option<SteadyStateValidation>,
+	#[serde(default)]
+	drain: Option<SteadyStateDrain>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct SteadyStateTask {
+	records: u32,
+	clients: u32,
+	threads: u32,
+	warmup_secs: u64,
+	measurement_secs: u64,
+	latency_sample_every: u64,
+	seed: u64,
+	worker_seed_derivation: String,
+	operation_mix: String,
+	operation_mix_period: u32,
+	key_selection: String,
+	zipfian_exponent: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStatePhases {
+	prepare: SteadyStatePhase,
+	warmup: SteadyStatePhase,
+	measure: SteadyStatePhase,
+	drain: SteadyStatePhase,
+	cleanup: SteadyStatePhase,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStatePhase {
+	elapsed_ms: f64,
+	status: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStateThroughput {
+	completed_operations: u64,
+	ops_per_sec: f64,
+	#[serde(default)]
+	per_second_windows: Vec<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStateLatency {
+	sample_count: u64,
+	p50_ms: f64,
+	p95_ms: f64,
+	p99_ms: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStateValidation {
+	errors: u64,
+	read_hits: u64,
+	read_misses: u64,
+	updates: u64,
+	scan_count_errors: u64,
+	observed_mix: String,
+	expected_mix_prefix: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct SteadyStateDrain {
+	elapsed_ms: f64,
+	timed_out: bool,
+}
 
 fn main() -> Result<ExitCode> {
 	let args = Args::parse();
+	let steady_state_mode = uses_steady_state_mode(&args);
+	if steady_state_mode {
+		let baseline = args
+			.baseline_steady_state_json
+			.as_deref()
+			.context("--baseline-steady-state-json is required for steady-state mode")?;
+		let current = args
+			.current_steady_state_json
+			.as_deref()
+			.context("--current-steady-state-json is required for steady-state mode")?;
+		if args.baseline_sync.is_some()
+			|| args.current_sync.is_some()
+			|| args.baseline_nosync.is_some()
+			|| args.current_nosync.is_some()
+			|| args.fjall_sync.is_some()
+			|| args.baseline_latency_sync.is_some()
+			|| args.current_latency_sync.is_some()
+			|| !args.rows.is_empty()
+			|| !args.ratio_rows.is_empty()
+		{
+			bail!("steady-state mode cannot be combined with legacy CRUD CSV inputs");
+		}
+		let rows =
+			steady_state_rows_to_evaluate(args.steady_state_rows, &args.optional_steady_state_rows);
+		let cfg = SteadyStateGateConfig {
+			rows,
+			optional_rows: args.optional_steady_state_rows,
+			max_ops_regression_pct: args.max_sync_regression_pct,
+			max_latency_regression_pct: args.max_latency_regression_pct,
+		};
+		let inputs = SteadyStateGateInputs {
+			baseline: read_steady_state_json(baseline)?,
+			current: read_steady_state_json(current)?,
+		};
+		let eval = evaluate_steady_state(&cfg, &inputs)?;
+		print!("{}", eval.report);
+		return Ok(if eval.passed {
+			ExitCode::SUCCESS
+		} else {
+			ExitCode::FAILURE
+		});
+	}
+
 	let rows = if args.rows.is_empty() {
 		DEFAULT_ROWS.iter().map(|row| row.to_string()).collect()
 	} else {
@@ -110,10 +283,18 @@ fn main() -> Result<ExitCode> {
 	};
 	validate_config(&cfg)?;
 	let inputs = GateInputs {
-		baseline_sync: read_crud_bench_csv(&args.baseline_sync)?,
-		current_sync: read_crud_bench_csv(&args.current_sync)?,
-		baseline_nosync: read_crud_bench_csv(&args.baseline_nosync)?,
-		current_nosync: read_crud_bench_csv(&args.current_nosync)?,
+		baseline_sync: read_crud_bench_csv(
+			args.baseline_sync.as_deref().context("--baseline-sync is required")?,
+		)?,
+		current_sync: read_crud_bench_csv(
+			args.current_sync.as_deref().context("--current-sync is required")?,
+		)?,
+		baseline_nosync: read_crud_bench_csv(
+			args.baseline_nosync.as_deref().context("--baseline-nosync is required")?,
+		)?,
+		current_nosync: read_crud_bench_csv(
+			args.current_nosync.as_deref().context("--current-nosync is required")?,
+		)?,
 		fjall_sync: args.fjall_sync.as_deref().map(read_crud_bench_csv).transpose()?,
 		baseline_latency_sync: args
 			.baseline_latency_sync
@@ -135,9 +316,49 @@ fn main() -> Result<ExitCode> {
 	Ok(ExitCode::SUCCESS)
 }
 
+fn uses_steady_state_mode(args: &Args) -> bool {
+	args.baseline_steady_state_json.is_some()
+		|| args.current_steady_state_json.is_some()
+		|| !args.steady_state_rows.is_empty()
+		|| !args.optional_steady_state_rows.is_empty()
+}
+
+fn steady_state_rows_to_evaluate(
+	required_rows: Vec<String>,
+	optional_rows: &[String],
+) -> Vec<String> {
+	let mut rows: Vec<_> = if required_rows.is_empty() {
+		DEFAULT_STEADY_STATE_ROWS.iter().map(|row| row.to_string()).collect()
+	} else {
+		required_rows
+	};
+	for row in optional_rows {
+		if !rows.contains(row) {
+			rows.push(row.clone());
+		}
+	}
+	rows
+}
+
 fn read_crud_bench_csv(path: &Path) -> Result<BenchCsv> {
 	let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
 	parse_crud_bench_csv(file).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn read_steady_state_json(path: &Path) -> Result<SteadyStateRows> {
+	let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+	parse_steady_state_json(file).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn parse_steady_state_json<R: Read>(reader: R) -> Result<SteadyStateRows> {
+	let artifact: SteadyStateArtifact = serde_json::from_reader(reader)?;
+	let mut rows = HashMap::new();
+	for row in artifact.steady_state {
+		if rows.insert(row.name.clone(), row).is_some() {
+			bail!("duplicate steady-state row found");
+		}
+	}
+	Ok(rows)
 }
 
 fn parse_crud_bench_csv<R: Read>(reader: R) -> Result<BenchCsv> {
@@ -346,7 +567,298 @@ fn evaluate(cfg: &GateConfig, inputs: &GateInputs) -> Result<Evaluation> {
 	}
 }
 
+fn evaluate_steady_state(
+	cfg: &SteadyStateGateConfig,
+	inputs: &SteadyStateGateInputs,
+) -> Result<Evaluation> {
+	validate_steady_state_config(cfg)?;
+
+	let mut failures = Vec::new();
+	let mut output = String::from("ToyKV steady-state perf gate\n\n");
+	output.push_str("Steady-state row gate:\n");
+
+	for row_name in &cfg.rows {
+		let baseline = required_steady_state_row(&inputs.baseline, row_name, "baseline")?;
+		let current = required_steady_state_row(&inputs.current, row_name, "current")?;
+		validate_steady_state_row(row_name, baseline, "baseline", cfg, &mut failures);
+		validate_steady_state_row(row_name, current, "current", cfg, &mut failures);
+		let baseline_optional_unsupported =
+			is_optional_unsupported(row_name, &baseline.status, cfg);
+		let current_optional_unsupported = is_optional_unsupported(row_name, &current.status, cfg);
+		validate_steady_state_comparable(row_name, baseline, current, &mut failures);
+
+		if baseline.status == "completed" && current.status == "completed" {
+			let Some(baseline_throughput) = &baseline.throughput else {
+				continue;
+			};
+			let Some(current_throughput) = &current.throughput else {
+				continue;
+			};
+			let Some(baseline_latency) = &baseline.latency else {
+				continue;
+			};
+			let Some(current_latency) = &current.latency else {
+				continue;
+			};
+			let ops_delta =
+				percent_change(current_throughput.ops_per_sec, baseline_throughput.ops_per_sec);
+			let p95_delta = percent_change(current_latency.p95_ms, baseline_latency.p95_ms);
+			let p99_delta = percent_change(current_latency.p99_ms, baseline_latency.p99_ms);
+			output.push_str(&format!(
+				"- {row_name}: OPS {:.2} -> {:.2} ({:+.2}%), p95 {:.2} -> {:.2} ms ({:+.2}%), p99 {:.2} -> {:.2} ms ({:+.2}%)\n",
+				baseline_throughput.ops_per_sec,
+				current_throughput.ops_per_sec,
+				ops_delta,
+				baseline_latency.p95_ms,
+				current_latency.p95_ms,
+				p95_delta,
+				baseline_latency.p99_ms,
+				current_latency.p99_ms,
+				p99_delta
+			));
+			if ops_delta < -cfg.max_ops_regression_pct {
+				failures.push(format!(
+					"{row_name} OPS regressed {ops_delta:.2}%, below -{:.2}%",
+					cfg.max_ops_regression_pct
+				));
+			}
+			if p95_delta > cfg.max_latency_regression_pct {
+				failures.push(format!(
+					"{row_name} p95 regressed {p95_delta:.2}%, above {:.2}%",
+					cfg.max_latency_regression_pct
+				));
+			}
+			if p99_delta > cfg.max_latency_regression_pct {
+				failures.push(format!(
+					"{row_name} p99 regressed {p99_delta:.2}%, above {:.2}%",
+					cfg.max_latency_regression_pct
+				));
+			}
+		} else if baseline_optional_unsupported && current_optional_unsupported {
+			output.push_str(&format!("- {row_name}: optional unsupported; skipped\n"));
+		} else {
+			output.push_str(&format!(
+				"- {row_name}: baseline status={}, current status={}\n",
+				baseline.status, current.status
+			));
+			if baseline_optional_unsupported != current_optional_unsupported {
+				failures.push(format!(
+					"{row_name} optional unsupported state differs: baseline={}, current={}",
+					baseline.status, current.status
+				));
+			}
+		}
+	}
+
+	if failures.is_empty() {
+		output.push_str("\nResult: PASS\n");
+		Ok(Evaluation {
+			report: output,
+			passed: true,
+		})
+	} else {
+		output.push_str("\nResult: FAIL\n");
+		for failure in &failures {
+			output.push_str(&format!("- {failure}\n"));
+		}
+		Ok(Evaluation {
+			report: output,
+			passed: false,
+		})
+	}
+}
+
+fn validate_steady_state_row(
+	row_name: &str,
+	row: &SteadyStateRow,
+	source: &str,
+	cfg: &SteadyStateGateConfig,
+	failures: &mut Vec<String>,
+) {
+	if row.suite != "steady-state" {
+		failures.push(format!("{source} {row_name} has invalid suite {:?}", row.suite));
+	}
+	if row.database.as_str().is_none_or(|database| database.trim().is_empty()) {
+		failures.push(format!("{source} {row_name} has invalid database field"));
+	}
+	validate_steady_state_task(row_name, &row.task, source, failures);
+	validate_steady_state_phases(row_name, row, source, failures);
+	match row.status.as_str() {
+		"completed" => {}
+		"unsupported" if cfg.optional_rows.iter().any(|optional| optional == row_name) => {
+			if row.unsupported_reason.as_deref().is_none_or(str::is_empty) {
+				failures.push(format!("{source} {row_name} is unsupported without a reason"));
+			}
+			return;
+		}
+		"unsupported" => {
+			failures.push(format!(
+				"{source} {row_name} is unsupported: {}",
+				row.unsupported_reason.as_deref().unwrap_or("missing reason")
+			));
+			return;
+		}
+		"failed" => {
+			failures.push(format!(
+				"{source} {row_name} failed: {}",
+				row.failure_reason.as_deref().unwrap_or("missing reason")
+			));
+			return;
+		}
+		other => {
+			failures.push(format!("{source} {row_name} has unknown status {other:?}"));
+			return;
+		}
+	}
+	let Some(throughput) = &row.throughput else {
+		failures.push(format!("{source} {row_name} is missing throughput"));
+		return;
+	};
+	if throughput.completed_operations == 0 {
+		failures.push(format!("{source} {row_name} completed zero operations"));
+	}
+	if throughput.ops_per_sec <= 0.0 || !throughput.ops_per_sec.is_finite() {
+		failures.push(format!("{source} {row_name} has invalid OPS"));
+	}
+	if throughput.per_second_windows.is_empty() {
+		failures.push(format!("{source} {row_name} is missing throughput windows"));
+	}
+	if throughput.per_second_windows.iter().any(|window| *window < 0.0 || !window.is_finite()) {
+		failures.push(format!("{source} {row_name} has invalid throughput windows"));
+	}
+	let Some(validation) = &row.validation else {
+		failures.push(format!("{source} {row_name} is missing validation"));
+		return;
+	};
+	if validation.errors > 0 {
+		failures.push(format!("{source} {row_name} has {} validation errors", validation.errors));
+	}
+	if validation.observed_mix.is_empty() || validation.expected_mix_prefix.is_empty() {
+		failures.push(format!("{source} {row_name} is missing validation mix details"));
+	}
+	let _ = (
+		validation.read_hits,
+		validation.read_misses,
+		validation.updates,
+		validation.scan_count_errors,
+	);
+	let Some(latency) = &row.latency else {
+		failures.push(format!("{source} {row_name} is missing latency"));
+		return;
+	};
+	if row.task.latency_sample_every > 0 && latency.sample_count == 0 {
+		failures.push(format!("{source} {row_name} is missing latency samples"));
+	}
+	if latency.p50_ms < 0.0
+		|| latency.p95_ms < 0.0
+		|| latency.p99_ms < 0.0
+		|| !latency.p50_ms.is_finite()
+		|| !latency.p95_ms.is_finite()
+		|| !latency.p99_ms.is_finite()
+	{
+		failures.push(format!("{source} {row_name} has invalid latency"));
+	}
+	if latency.p50_ms > latency.p95_ms || latency.p95_ms > latency.p99_ms {
+		failures.push(format!("{source} {row_name} has unordered latency quantiles"));
+	}
+	let Some(drain) = &row.drain else {
+		failures.push(format!("{source} {row_name} is missing drain"));
+		return;
+	};
+	if drain.elapsed_ms < 0.0 || !drain.elapsed_ms.is_finite() {
+		failures.push(format!("{source} {row_name} has invalid drain elapsed time"));
+	}
+	if drain.timed_out {
+		failures.push(format!("{source} {row_name} drain timed out"));
+	}
+}
+
+fn validate_steady_state_task(
+	row_name: &str,
+	task: &SteadyStateTask,
+	source: &str,
+	failures: &mut Vec<String>,
+) {
+	if task.records == 0 {
+		failures.push(format!("{source} {row_name} has zero records"));
+	}
+	if task.clients == 0 || task.threads == 0 {
+		failures.push(format!("{source} {row_name} has invalid concurrency"));
+	}
+	if task.measurement_secs == 0 {
+		failures.push(format!("{source} {row_name} has zero measurement duration"));
+	}
+	if task.worker_seed_derivation.is_empty()
+		|| task.operation_mix.is_empty()
+		|| task.key_selection.is_empty()
+	{
+		failures.push(format!("{source} {row_name} is missing task metadata"));
+	}
+	if task.operation_mix_period == 0 {
+		failures.push(format!("{source} {row_name} has zero operation mix period"));
+	}
+	if task.zipfian_exponent < 0.0 || !task.zipfian_exponent.is_finite() {
+		failures.push(format!("{source} {row_name} has invalid Zipfian exponent"));
+	}
+	let _ = (task.warmup_secs, task.latency_sample_every, task.seed);
+}
+
+fn validate_steady_state_comparable(
+	row_name: &str,
+	baseline: &SteadyStateRow,
+	current: &SteadyStateRow,
+	failures: &mut Vec<String>,
+) {
+	if baseline.database != current.database {
+		failures.push(format!("{row_name} database differs between baseline and current"));
+	}
+	if baseline.sync != current.sync {
+		failures.push(format!("{row_name} sync setting differs between baseline and current"));
+	}
+	if baseline.task != current.task {
+		failures.push(format!("{row_name} task metadata differs between baseline and current"));
+	}
+}
+
+fn validate_steady_state_phases(
+	row_name: &str,
+	row: &SteadyStateRow,
+	source: &str,
+	failures: &mut Vec<String>,
+) {
+	let phases = &row.phases;
+	for (phase_name, phase) in [
+		("prepare", &phases.prepare),
+		("warmup", &phases.warmup),
+		("measure", &phases.measure),
+		("drain", &phases.drain),
+		("cleanup", &phases.cleanup),
+	] {
+		if phase.elapsed_ms < 0.0 || !phase.elapsed_ms.is_finite() {
+			failures.push(format!("{source} {row_name} has invalid {phase_name} phase time"));
+		}
+		if !matches!(phase.status.as_str(), "completed" | "unsupported" | "failed") {
+			failures.push(format!(
+				"{source} {row_name} has invalid {phase_name} phase status {:?}",
+				phase.status
+			));
+		}
+		if row.status == "completed" && phase.status != "completed" {
+			failures.push(format!(
+				"{source} {row_name} completed row has non-completed {phase_name} phase"
+			));
+		}
+	}
+}
+
 fn validate_config(cfg: &GateConfig) -> Result<()> {
+	for row in cfg.rows.iter().chain(cfg.ratio_rows.iter()) {
+		if is_steady_state_row(row) {
+			bail!(
+				"steady-state row {row:?} requires a steady-state JSON or sidecar gate, not the legacy CSV-only perf-gate"
+			);
+		}
+	}
 	if cfg.max_sync_regression_pct < 0.0 {
 		bail!("--max-sync-regression-pct cannot be negative");
 	}
@@ -361,6 +873,47 @@ fn validate_config(cfg: &GateConfig) -> Result<()> {
 		);
 	}
 	Ok(())
+}
+
+fn validate_steady_state_config(cfg: &SteadyStateGateConfig) -> Result<()> {
+	if cfg.max_ops_regression_pct < 0.0 {
+		bail!("--max-sync-regression-pct cannot be negative");
+	}
+	if cfg.max_latency_regression_pct < 0.0 {
+		bail!("--max-latency-regression-pct cannot be negative");
+	}
+	if cfg.rows.is_empty() {
+		bail!("at least one steady-state row is required");
+	}
+	Ok(())
+}
+
+fn is_optional_unsupported(row_name: &str, status: &str, cfg: &SteadyStateGateConfig) -> bool {
+	status == "unsupported" && cfg.optional_rows.iter().any(|optional| optional == row_name)
+}
+
+fn is_steady_state_row(row: &str) -> bool {
+	row == "steady-state"
+		|| row.starts_with("[T]steady-state::")
+		|| row.starts_with("steady-state::")
+		|| matches!(
+			row,
+			"balanced_zipfian"
+				| "read_heavy_zipfian"
+				| "update_heavy_zipfian"
+				| "point_read_zipfian"
+				| "point_read_missing_in_range"
+				| "range_scan_uniform"
+				| "sustained_ingest"
+		)
+}
+
+fn required_steady_state_row<'a>(
+	rows: &'a SteadyStateRows,
+	row: &str,
+	source: &str,
+) -> Result<&'a SteadyStateRow> {
+	rows.get(row).ok_or_else(|| anyhow!("missing steady-state row {row:?} in {source} JSON"))
 }
 
 fn required_row<'a>(rows: &'a BenchCsv, row: &str, source: &str) -> Result<&'a BenchRow> {
@@ -402,6 +955,55 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 [C]reate,1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,1000.00,0,0,0,0,0,0,0,0,0/0/0
 [B]atch::batch_create_1000 (100 batches of 1000),1s,1.00 ms,2.00 ms,1.90 ms,1.80 ms,1.50 ms,1.00 ms,0.50 ms,0.10 ms,0.01 ms,1.00 ms,500.00,0,0,0,0,0,0,0,0,0/0/0
 ";
+	const STEADY_STATE_JSON: &str = r#"{
+  "steady_state": [
+    {
+      "name": "balanced_zipfian",
+      "suite": "steady-state",
+      "database": "toykv",
+      "status": "completed",
+      "unsupported_reason": null,
+      "sync": true,
+      "task": {
+        "records": 100,
+        "clients": 1,
+        "threads": 1,
+        "warmup_secs": 0,
+        "measurement_secs": 1,
+        "latency_sample_every": 1,
+        "seed": 1,
+        "worker_seed_derivation": "splitmix64(seed ^ worker_index)",
+        "operation_mix": "read=1.000000",
+        "operation_mix_period": 1000,
+        "key_selection": "scrambled_zipfian",
+        "zipfian_exponent": 0.99
+      },
+      "phases": {
+        "prepare": { "elapsed_ms": 1.0, "status": "completed" },
+        "warmup": { "elapsed_ms": 0.0, "status": "completed" },
+        "measure": { "elapsed_ms": 1000.0, "status": "completed" },
+        "drain": { "elapsed_ms": 1.0, "status": "completed" },
+        "cleanup": { "elapsed_ms": 1.0, "status": "completed" }
+      },
+      "throughput": {
+        "completed_operations": 100,
+        "ops_per_sec": 1000.0,
+        "per_second_windows": [1000.0]
+      },
+      "latency": { "sample_count": 100, "p50_ms": 1.0, "p95_ms": 2.0, "p99_ms": 4.0 },
+      "validation": {
+        "errors": 0,
+        "read_hits": 100,
+        "read_misses": 0,
+        "updates": 0,
+        "scan_count_errors": 0,
+        "observed_mix": "read=1.000000",
+        "expected_mix_prefix": "read=100"
+      },
+      "drain": { "elapsed_ms": 1.0, "timed_out": false }
+    }
+  ]
+}"#;
 
 	#[test]
 	fn parses_crud_bench_csv_aliases() {
@@ -519,6 +1121,314 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 		.expect_err("missing current latency CSV fails");
 
 		assert!(err.to_string().contains("--current-latency-sync"));
+	}
+
+	#[test]
+	fn rejects_steady_state_rows_in_legacy_gate() {
+		for row in ["balanced_zipfian", "read_heavy_zipfian", "update_heavy_zipfian"] {
+			let cfg = GateConfig {
+				rows: vec![row.into()],
+				ratio_rows: Vec::new(),
+				max_sync_regression_pct: 5.0,
+				min_ratio_improvements: 0,
+				max_latency_regression_pct: 5.0,
+			};
+
+			let err =
+				validate_config(&cfg).expect_err("steady-state rows need a steady-state gate");
+
+			assert!(err.to_string().contains("steady-state row"));
+		}
+	}
+
+	#[test]
+	fn default_steady_state_gate_includes_phase5_rows() {
+		let rows = steady_state_rows_to_evaluate(Vec::new(), &[]);
+
+		assert!(rows.contains(&"read_heavy_zipfian".to_string()));
+		assert!(rows.contains(&"update_heavy_zipfian".to_string()));
+	}
+
+	#[test]
+	fn optional_steady_state_rows_are_evaluated() {
+		let rows = steady_state_rows_to_evaluate(
+			vec!["balanced_zipfian".to_string()],
+			&["read_heavy_zipfian".to_string()],
+		);
+
+		assert_eq!(rows, vec!["balanced_zipfian", "read_heavy_zipfian"]);
+	}
+
+	#[test]
+	fn parses_steady_state_json_rows() {
+		let rows = parse_steady_state_json(STEADY_STATE_JSON.as_bytes()).expect("parse JSON");
+		let row = required_steady_state_row(&rows, "balanced_zipfian", "test").unwrap();
+
+		assert_eq!(row.status, "completed");
+		assert_eq!(row.throughput.as_ref().unwrap().completed_operations, 100);
+		assert_eq!(row.latency.as_ref().unwrap().sample_count, 100);
+	}
+
+	#[test]
+	fn passes_valid_steady_state_gate() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[steady_state_row("balanced_zipfian", 980.0, 2.05, 4.1)]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(eval.passed);
+		assert!(eval.report.contains("Result: PASS"));
+	}
+
+	#[test]
+	fn fails_invalid_steady_state_gate() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let mut current = steady_state_row("balanced_zipfian", 900.0, 2.3, 4.5);
+		current.validation.as_mut().unwrap().errors = 1;
+		current.latency.as_mut().unwrap().sample_count = 0;
+		current.drain.as_mut().unwrap().timed_out = true;
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("validation errors"));
+		assert!(eval.report.contains("missing latency samples"));
+		assert!(eval.report.contains("drain timed out"));
+		assert!(eval.report.contains("OPS regressed -10.00%"));
+	}
+
+	#[test]
+	fn optional_unsupported_steady_state_row_is_skipped() {
+		let mut cfg = steady_state_cfg(&["range_scan_uniform"]);
+		cfg.optional_rows = vec!["range_scan_uniform".into()];
+		let row = unsupported_steady_state_row("range_scan_uniform", Some("NotSupported"));
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(std::slice::from_ref(&row)),
+			current: steady_state_rows(&[row]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(eval.passed);
+	}
+
+	#[test]
+	fn optional_unsupported_steady_state_row_requires_reason() {
+		let mut cfg = steady_state_cfg(&["range_scan_uniform"]);
+		cfg.optional_rows = vec!["range_scan_uniform".into()];
+		let row = unsupported_steady_state_row("range_scan_uniform", None);
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(std::slice::from_ref(&row)),
+			current: steady_state_rows(&[row]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("unsupported without a reason"));
+	}
+
+	#[test]
+	fn optional_unsupported_steady_state_row_must_match_both_artifacts() {
+		let mut cfg = steady_state_cfg(&["range_scan_uniform"]);
+		cfg.optional_rows = vec!["range_scan_uniform".into()];
+		let unsupported = unsupported_steady_state_row("range_scan_uniform", Some("NotSupported"));
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row(
+				"range_scan_uniform",
+				1000.0,
+				2.0,
+				4.0,
+			)]),
+			current: steady_state_rows(&[unsupported]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("optional unsupported state differs"));
+	}
+
+	#[test]
+	fn rejects_negative_steady_state_latency() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, -1.0, 4.0)]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("invalid latency"));
+	}
+
+	#[test]
+	fn rejects_unordered_steady_state_latency() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 10.0, 4.0)]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("unordered latency quantiles"));
+	}
+
+	#[test]
+	fn rejects_invalid_steady_state_throughput_windows() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let mut current = steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0);
+		current.throughput.as_mut().unwrap().per_second_windows = vec![-1.0];
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("invalid throughput windows"));
+	}
+
+	#[test]
+	fn rejects_mismatched_steady_state_metadata() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let baseline = steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0);
+		let mut current = steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0);
+		current.database = serde_json::Value::String("rocksdb".into());
+		current.sync = false;
+		current.task.measurement_secs = 2;
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[baseline]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("database differs"));
+		assert!(eval.report.contains("sync setting differs"));
+		assert!(eval.report.contains("task metadata differs"));
+	}
+
+	#[test]
+	fn rejects_empty_steady_state_database() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let mut current = steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0);
+		current.database = serde_json::Value::String(String::new());
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("invalid database field"));
+	}
+
+	#[test]
+	fn rejects_whitespace_steady_state_database() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let mut current = steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0);
+		current.database = serde_json::Value::String("   ".into());
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("invalid database field"));
+	}
+
+	#[test]
+	fn optional_unsupported_rows_must_be_comparable() {
+		let mut cfg = steady_state_cfg(&["range_scan_uniform"]);
+		cfg.optional_rows = vec!["range_scan_uniform".into()];
+		let baseline = unsupported_steady_state_row("range_scan_uniform", Some("NotSupported"));
+		let mut current = unsupported_steady_state_row("range_scan_uniform", Some("NotSupported"));
+		current.database = serde_json::Value::String("rocksdb".into());
+		current.task.records = 999;
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[baseline]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("database differs"));
+		assert!(eval.report.contains("task metadata differs"));
+	}
+
+	#[test]
+	fn rejects_completed_row_with_failed_phase() {
+		let cfg = steady_state_cfg(&["balanced_zipfian"]);
+		let mut current = steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0);
+		current.phases.cleanup.status = "failed".into();
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0)]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("completed row has non-completed cleanup phase"));
+	}
+
+	#[test]
+	fn rejects_partial_steady_state_json_schema() {
+		let json = r#"{
+  "steady_state": [
+    {
+      "name": "balanced_zipfian",
+      "status": "completed",
+      "task": { "latency_sample_every": 1 },
+      "throughput": {
+        "completed_operations": 100,
+        "ops_per_sec": 1000.0,
+        "per_second_windows": [1000.0]
+      },
+      "latency": { "sample_count": 100, "p95_ms": 2.0, "p99_ms": 4.0 },
+      "validation": { "errors": 0 },
+      "drain": { "timed_out": false }
+    }
+  ]
+}"#;
+
+		let err = parse_steady_state_json(json.as_bytes()).expect_err("partial schema fails");
+
+		assert!(err.to_string().contains("missing field"));
+	}
+
+	#[test]
+	fn steady_state_mode_requires_json_pair() {
+		let err =
+			Args::try_parse_from(["perf-gate", "--baseline-steady-state-json", "baseline.json"])
+				.expect("clap accepts partial steady-state mode");
+		assert!(err.baseline_steady_state_json.is_some());
+		assert!(err.current_steady_state_json.is_none());
+	}
+
+	#[test]
+	fn steady_state_row_flag_selects_steady_state_mode() {
+		let args = Args::try_parse_from(["perf-gate", "--steady-state-row", "balanced_zipfian"])
+			.expect("steady-state row flag parses");
+
+		assert!(uses_steady_state_mode(&args));
 	}
 
 	#[test]
@@ -734,5 +1644,114 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 				)
 			})
 			.collect()
+	}
+
+	fn steady_state_cfg(rows: &[&str]) -> SteadyStateGateConfig {
+		SteadyStateGateConfig {
+			rows: rows.iter().map(|row| (*row).to_string()).collect(),
+			optional_rows: Vec::new(),
+			max_ops_regression_pct: 5.0,
+			max_latency_regression_pct: 5.0,
+		}
+	}
+
+	fn steady_state_rows(rows: &[SteadyStateRow]) -> SteadyStateRows {
+		rows.iter().cloned().map(|row| (row.name.clone(), row)).collect()
+	}
+
+	fn steady_state_row(name: &str, ops: f64, p95_ms: f64, p99_ms: f64) -> SteadyStateRow {
+		SteadyStateRow {
+			name: name.into(),
+			suite: "steady-state".into(),
+			database: serde_json::Value::String("toykv".into()),
+			status: "completed".into(),
+			unsupported_reason: None,
+			failure_reason: None,
+			sync: true,
+			task: SteadyStateTask {
+				records: 100,
+				clients: 1,
+				threads: 1,
+				warmup_secs: 0,
+				measurement_secs: 1,
+				latency_sample_every: 1,
+				seed: 1,
+				worker_seed_derivation: "splitmix64(seed ^ worker_index)".into(),
+				operation_mix: "read=1.000000".into(),
+				operation_mix_period: 1000,
+				key_selection: "scrambled_zipfian".into(),
+				zipfian_exponent: 0.99,
+			},
+			phases: completed_steady_state_phases(),
+			throughput: Some(SteadyStateThroughput {
+				completed_operations: 100,
+				ops_per_sec: ops,
+				per_second_windows: vec![ops],
+			}),
+			latency: Some(SteadyStateLatency {
+				sample_count: 100,
+				p50_ms: p95_ms / 2.0,
+				p95_ms,
+				p99_ms,
+			}),
+			validation: Some(SteadyStateValidation {
+				errors: 0,
+				read_hits: 100,
+				read_misses: 0,
+				updates: 0,
+				scan_count_errors: 0,
+				observed_mix: "read=1.000000".into(),
+				expected_mix_prefix: "read=100".into(),
+			}),
+			drain: Some(SteadyStateDrain {
+				elapsed_ms: 1.0,
+				timed_out: false,
+			}),
+		}
+	}
+
+	fn unsupported_steady_state_row(name: &str, reason: Option<&str>) -> SteadyStateRow {
+		SteadyStateRow {
+			name: name.into(),
+			suite: "steady-state".into(),
+			database: serde_json::Value::String("toykv".into()),
+			status: "unsupported".into(),
+			unsupported_reason: reason.map(str::to_string),
+			failure_reason: None,
+			sync: true,
+			task: SteadyStateTask {
+				records: 100,
+				clients: 1,
+				threads: 1,
+				warmup_secs: 0,
+				measurement_secs: 1,
+				latency_sample_every: 1,
+				seed: 1,
+				worker_seed_derivation: "splitmix64(seed ^ worker_index)".into(),
+				operation_mix: "scan=1.000000".into(),
+				operation_mix_period: 1000,
+				key_selection: "uniform".into(),
+				zipfian_exponent: 0.99,
+			},
+			phases: completed_steady_state_phases(),
+			throughput: None,
+			latency: None,
+			validation: None,
+			drain: None,
+		}
+	}
+
+	fn completed_steady_state_phases() -> SteadyStatePhases {
+		let phase = SteadyStatePhase {
+			elapsed_ms: 1.0,
+			status: "completed".into(),
+		};
+		SteadyStatePhases {
+			prepare: phase.clone(),
+			warmup: phase.clone(),
+			measure: phase.clone(),
+			drain: phase.clone(),
+			cleanup: phase,
+		}
 	}
 }

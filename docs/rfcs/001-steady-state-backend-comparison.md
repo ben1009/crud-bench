@@ -77,6 +77,8 @@ The MVP should implement these rows first:
 | Row | Operation mix | Key selection | Dataset | Purpose |
 |---|---:|---|---|---|
 | `balanced_zipfian` | 50% read, 50% update | scrambled Zipfian, exponent 0.99 | prepared | Primary mixed read/write gate |
+| `read_heavy_zipfian` | 95% read, 5% update | scrambled Zipfian, exponent 0.99 | prepared | Cache-heavy churn |
+| `update_heavy_zipfian` | 5% read, 95% update | scrambled Zipfian, exponent 0.99 | prepared | Write-heavy churn |
 | `point_read_zipfian` | 100% read | scrambled Zipfian, exponent 0.99 | prepared | Hot-key read throughput and latency |
 | `range_scan_uniform` | 100% scan | uniform positional start | prepared | Bounded scan throughput and count validation |
 | `sustained_ingest` | 100% create | unique sequential | fresh empty | Steady durable write path |
@@ -85,8 +87,6 @@ Later rows:
 
 | Row | Operation mix | Purpose |
 |---|---:|---|
-| `read_heavy_zipfian` | 95% read, 5% update | Cache-heavy churn |
-| `update_heavy_zipfian` | 5% read, 95% update | Write-heavy churn |
 | `point_read_missing_in_range` | 100% missing read | Negative lookup behavior |
 | `transaction_contention` | parameterized | Serializable transaction contention, only after the adapter API supports it |
 
@@ -274,7 +274,7 @@ Required JSON fields:
 }
 ```
 
-Required legacy CSV mapping:
+Required legacy CSV mapping for completed rows:
 
 ```text
 Test = [T]steady-state::<row>
@@ -284,24 +284,32 @@ OPS = throughput.ops_per_sec
 99th = latency.p99_ms
 ```
 
+Unsupported and failed steady-state rows must use the legacy CSV skip marker
+columns, even when the JSON row keeps diagnostic measurement data.
+
 Optional sidecar CSV columns:
 
 ```text
-suite,row,database,status,unsupported_reason,sync,completed_operations,
-validation_errors,drain_elapsed_ms,drain_timed_out,operation_mix,key_selection
+suite,row,database,status,unsupported_reason,failure_reason,sync,
+completed_operations,validation_errors,latency_sample_count,
+latency_sample_every,drain_elapsed_ms,drain_timed_out,operation_mix,
+key_selection
 ```
 
-Steady-state gate tools must read JSON or a required sidecar artifact for
-validation, drain, and unsupported-row state. The legacy CSV is retained for
-existing throughput and latency consumers only; it is not sufficient by itself
-to decide a steady-state gate.
+Steady-state gate tools must read the JSON artifact for throughput, latency,
+validation, drain, and unsupported-row state. The sidecar CSV is a diagnostic
+artifact for status dashboards and quick inspection; it intentionally does not
+replace JSON for gate decisions. The legacy CSV is retained for existing
+throughput and latency consumers only; it is not sufficient by itself to decide
+a steady-state gate.
 
 Allowed row statuses are `completed`, `unsupported`, and `failed`.
 Unsupported rows must set `status = "unsupported"` and a non-empty
 `unsupported_reason`. For unsupported rows, throughput, latency, validation,
 and drain fields may be absent or null, and gate tools must treat the row as
 skipped only when the gate marks that row optional. Failed rows must not be
-converted to unsupported rows.
+converted to unsupported rows. `failure_reason` is optional for completed and
+unsupported JSON rows, and required for failed rows.
 
 Gate tools must reject rows with:
 
@@ -382,12 +390,14 @@ first 1234 scheduled slots, not a rounded 617/617 split.
 
 ## 12. Gates
 
-The first ToyKV vs RocksDB gate should compare:
+The current default ToyKV vs RocksDB steady-state gate compares:
 
 1. `balanced_zipfian`;
-2. `point_read_zipfian`;
-3. `range_scan_uniform`;
-4. `sustained_ingest`.
+2. `read_heavy_zipfian`;
+3. `update_heavy_zipfian`;
+4. `point_read_zipfian`;
+5. `range_scan_uniform`;
+6. `sustained_ingest`.
 
 Acceptance for a ToyKV storage-engine performance PR:
 
@@ -434,15 +444,16 @@ the accepted benchmark priority.
 ### Phase 4: Comparison And Gate Tooling
 
 1. Run ToyKV and RocksDB smoke rows.
-2. Add `perf-gate` support for steady-state JSON or required sidecar rows.
-   Keep legacy CSV parsing for existing OPS/p95/p99 comparisons only.
+2. Add `perf-gate` support for steady-state JSON rows. Keep legacy CSV parsing
+   for existing OPS/p95/p99 comparisons only.
 3. Document the ToyKV vs RocksDB command shape.
-4. Add the resulting artifact names to the ToyKV benchmark report.
+4. Defer publishing resulting artifact names in the ToyKV benchmark report to
+   the first ToyKV-side report update that consumes these crud-bench artifacts.
 
 ### Phase 5: Follow-Up Rows
 
-1. Add `read_heavy_zipfian`.
-2. Add `update_heavy_zipfian`.
+1. Add `read_heavy_zipfian`. Done in this implementation.
+2. Add `update_heavy_zipfian`. Done in this implementation.
 3. Add `point_read_missing_in_range`.
 4. Add `transaction_contention` after the adapter API supports serializable
    transaction configuration.

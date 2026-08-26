@@ -8,7 +8,9 @@ use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
 use crate::keyprovider::KeyProvider;
 use crate::result::{
 	BenchmarkMetadata, BenchmarkResult, OperationMetric, OperationResult, ScanResult, ScanRun,
-	ScanWorkload, writes_ratio_percent,
+	ScanWorkload, SteadyStateDrain, SteadyStateLatency, SteadyStatePhase, SteadyStatePhases,
+	SteadyStateResult, SteadyStateStatus, SteadyStateTask, SteadyStateThroughput,
+	SteadyStateValidation, writes_ratio_percent,
 };
 use crate::system::SystemInfo;
 use crate::terminal::BenchUi;
@@ -18,8 +20,8 @@ use crate::valueprovider::ColumnType;
 use crate::valueprovider::ValueProvider;
 use crate::workloads;
 use crate::{
-	Args, BatchOperation, Batches, Index, Scan, ScanWithWrites, Scans, VectorHoldout,
-	VectorIndexStrategy, VectorQuerySpec,
+	Args, BatchOperation, Batches, Index, Scan, ScanWithWrites, Scans, SteadyStatePreset, Suite,
+	VectorHoldout, VectorIndexStrategy, VectorQuerySpec,
 };
 
 use anyhow::{Context, Result, bail};
@@ -32,11 +34,22 @@ use tokio::time::Instant;
 
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 /// Maximum wait when polling until the first datastore client connects.
 const TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_STEADY_STATE_WORKLOADS: &[SteadyStateWorkload] = &[
+	SteadyStateWorkload::BalancedZipfian,
+	SteadyStateWorkload::ReadHeavyZipfian,
+	SteadyStateWorkload::UpdateHeavyZipfian,
+	SteadyStateWorkload::PointReadZipfian,
+	SteadyStateWorkload::PointReadMissingInRange,
+	SteadyStateWorkload::RangeScanUniform,
+	SteadyStateWorkload::SustainedIngest,
+];
+const MAX_OPERATION_MIX_PERIOD: u32 = 100_000;
 
 /// Fixed sleep between phases to let any server-side phase tail settle
 /// (open snapshots, draining tasks) before the next phase opens its
@@ -146,6 +159,16 @@ pub(crate) struct Benchmark {
 	pub(crate) bench_ui: BenchUi,
 	/// Grep-friendly `… starting` / `Benchmark starting` lines for profiling scripts
 	pub(crate) emit_phase_markers: bool,
+	pub(crate) suite: Suite,
+	pub(crate) steady_state_benches: Option<String>,
+	pub(crate) steady_state_preset: SteadyStatePreset,
+	pub(crate) warmup_secs: Option<u64>,
+	pub(crate) measurement_secs: Option<u64>,
+	pub(crate) latency_sample_every: Option<u64>,
+	pub(crate) seed: u64,
+	pub(crate) zipfian_exponent: f64,
+	pub(crate) operation_mix: Option<String>,
+	pub(crate) operation_mix_period: u32,
 }
 
 impl Benchmark {
@@ -172,6 +195,16 @@ impl Benchmark {
 			operation_timeout: Duration::from_secs(args.operation_timeout),
 			bench_ui: BenchUi::new(args.color),
 			emit_phase_markers,
+			suite: args.suite,
+			steady_state_benches: args.bench.clone(),
+			steady_state_preset: args.preset,
+			warmup_secs: args.warmup_secs,
+			measurement_secs: args.measurement_secs,
+			latency_sample_every: args.latency_sample_every,
+			seed: args.seed,
+			zipfian_exponent: args.zipfian_exponent,
+			operation_mix: args.operation_mix.clone(),
+			operation_mix_period: args.operation_mix_period,
 		}
 	}
 
@@ -240,6 +273,27 @@ impl Benchmark {
 		// Start the benchmark (optional line for log-based profiling)
 		if self.emit_phase_markers {
 			self.bench_ui.println_plain("Benchmark starting");
+		}
+		if self.suite == Suite::SteadyState {
+			let steady_state =
+				self.run_steady_state::<C>(&clients, kp, vp.clone(), database.clone()).await?;
+			if self.emit_phase_markers {
+				self.bench_ui.println_plain("Benchmark complete");
+			}
+			self.wait_for_client(&engine).await?.shutdown().await?;
+			return Ok(BenchmarkResult {
+				database,
+				system,
+				metadata,
+				creates: None,
+				reads: None,
+				updates: None,
+				scans: Vec::new(),
+				steady_state,
+				batches: Vec::new(),
+				deletes: None,
+				sample,
+			});
 		}
 		// Run the "creates" benchmark (skipped if --skip-writes)
 		let creates = if self.skip_writes {
@@ -700,10 +754,493 @@ impl Benchmark {
 			reads,
 			updates,
 			scans: scan_results,
+			steady_state: Vec::new(),
 			batches: batch_results,
 			deletes,
 			sample,
 		})
+	}
+
+	async fn run_steady_state<C>(
+		&self,
+		clients: &[Arc<C>],
+		kp: KeyProvider,
+		vp: ValueProvider,
+		database: Option<String>,
+	) -> Result<Vec<SteadyStateResult>>
+	where
+		C: BenchmarkClient + Send + Sync,
+	{
+		let config = SteadyStateConfig::from_benchmark(self)?;
+		let workloads = config.workloads()?;
+		let mut results = Vec::with_capacity(workloads.len());
+		for workload in workloads {
+			self.bench_ui.section_header(&format!("Steady-state · {}", workload.name()));
+			if let Err(e) = self
+				.reset_steady_state_row::<C>(clients, kp, &config, workload, config.records as u64)
+				.await
+			{
+				let row = if e.to_string().eq(NOT_SUPPORTED_ERROR) {
+					unsupported_steady_state_row(self, database.clone(), &config, workload, e)
+				} else {
+					failed_steady_state_row(self, database.clone(), &config, workload, e)
+				};
+				results.push(row);
+				continue;
+			}
+			let row = match self
+				.run_steady_state_row::<C>(
+					clients,
+					kp,
+					vp.clone(),
+					database.clone(),
+					&config,
+					workload,
+				)
+				.await
+			{
+				Ok(row) => row,
+				Err(e) if e.to_string().eq(NOT_SUPPORTED_ERROR) => {
+					if let Err(reset_error) = self
+						.reset_steady_state_row::<C>(
+							clients,
+							kp,
+							&config,
+							workload,
+							config.records as u64,
+						)
+						.await
+					{
+						eprintln!(
+							"steady-state error cleanup for {} failed: {reset_error:#}",
+							workload.name()
+						);
+					}
+					unsupported_steady_state_row(self, database.clone(), &config, workload, e)
+				}
+				Err(e) => {
+					if let Err(reset_error) = self
+						.reset_steady_state_row::<C>(
+							clients,
+							kp,
+							&config,
+							workload,
+							config.records as u64,
+						)
+						.await
+					{
+						eprintln!(
+							"steady-state error cleanup for {} failed: {reset_error:#}",
+							workload.name()
+						);
+					}
+					failed_steady_state_row(self, database.clone(), &config, workload, e)
+				}
+			};
+			results.push(row);
+		}
+		Ok(results)
+	}
+
+	async fn run_steady_state_row<C>(
+		&self,
+		clients: &[Arc<C>],
+		kp: KeyProvider,
+		vp: ValueProvider,
+		database: Option<String>,
+		config: &SteadyStateConfig,
+		workload: SteadyStateWorkload,
+	) -> Result<SteadyStateResult>
+	where
+		C: BenchmarkClient + Send + Sync,
+	{
+		let prepare_start = Instant::now();
+		if workload.requires_prepared_dataset() {
+			self.load_steady_state_dataset(clients, kp, vp.clone(), config.records).await?;
+		}
+		let prepare = completed_phase(prepare_start.elapsed());
+		let mut next_op_index = 0;
+
+		let warmup_start = Instant::now();
+		if config.warmup > Duration::ZERO {
+			let warmup = self
+				.run_steady_state_window::<C>(
+					clients,
+					kp,
+					vp.clone(),
+					config,
+					workload,
+					config.warmup,
+					false,
+					next_op_index,
+				)
+				.await?;
+			next_op_index += warmup.completed;
+			if let Some(reason) = warmup.failure_reason {
+				self.reset_steady_state_row(clients, kp, config, workload, warmup.cleanup_upper)
+					.await?;
+				bail!(reason);
+			}
+		}
+		let warmup = completed_phase(warmup_start.elapsed());
+
+		let measure_start = Instant::now();
+		let measurement = self
+			.run_steady_state_window::<C>(
+				clients,
+				kp,
+				vp,
+				config,
+				workload,
+				config.measurement,
+				true,
+				next_op_index,
+			)
+			.await?;
+		let measure = completed_phase(measure_start.elapsed());
+		let measurement_failure = measurement.failure_reason.clone();
+
+		let drain_start = Instant::now();
+		self.quiesce_and_mark().await;
+		let drain_elapsed = drain_start.elapsed();
+		let cleanup_start = Instant::now();
+		let cleanup_result = self
+			.reset_steady_state_row(clients, kp, config, workload, measurement.cleanup_upper)
+			.await;
+		let cleanup_elapsed = cleanup_start.elapsed();
+
+		let observed_mix = measurement.observed_mix();
+		let result = measurement.result;
+		let throughput = result.as_ref().map(|r| SteadyStateThroughput {
+			completed_operations: measurement.completed,
+			ops_per_sec: r.ops(),
+			per_second_windows: measurement
+				.per_second_windows
+				.iter()
+				.map(|count| *count as f64)
+				.collect(),
+		});
+		let latency = result.as_ref().map(|r| SteadyStateLatency {
+			sample_count: measurement.latency_samples,
+			p50_ms: r.q50() as f64 / 1000.0,
+			p95_ms: r.q95() as f64 / 1000.0,
+			p99_ms: r.q99() as f64 / 1000.0,
+		});
+		let validation = Some(SteadyStateValidation {
+			errors: measurement.errors,
+			read_hits: measurement.read_hits,
+			read_misses: measurement.read_misses,
+			updates: measurement.updates,
+			scan_count_errors: measurement.scan_count_errors,
+			observed_mix,
+			expected_mix_prefix: workload.expected_mix_prefix(config, measurement.completed),
+		});
+		let measurement_unsupported = measurement_failure.as_deref() == Some(NOT_SUPPORTED_ERROR);
+		let mut status = if measurement_unsupported {
+			SteadyStateStatus::Unsupported
+		} else if measurement_failure.is_some() {
+			SteadyStateStatus::Failed
+		} else {
+			SteadyStateStatus::Completed
+		};
+		let mut unsupported_reason =
+			measurement_unsupported.then(|| NOT_SUPPORTED_ERROR.to_string());
+		let mut failure_reason =
+			(!measurement_unsupported).then_some(measurement_failure).flatten();
+		let cleanup_status = match cleanup_result {
+			Ok(()) => SteadyStateStatus::Completed,
+			Err(e) => {
+				status = SteadyStateStatus::Failed;
+				let cleanup_failure = format!("cleanup failed: {e:#}");
+				failure_reason = Some(match failure_reason.or(unsupported_reason.take()) {
+					Some(reason) => format!("{reason}; {cleanup_failure}"),
+					None => cleanup_failure,
+				});
+				SteadyStateStatus::Failed
+			}
+		};
+		let cleanup = SteadyStatePhase {
+			elapsed_ms: cleanup_elapsed.as_secs_f64() * 1000.0,
+			status: cleanup_status,
+		};
+
+		Ok(SteadyStateResult {
+			name: workload.name().to_string(),
+			suite: "steady-state",
+			database,
+			status,
+			unsupported_reason,
+			failure_reason,
+			sync: self.sync,
+			task: workload.task(self, config),
+			phases: SteadyStatePhases {
+				prepare,
+				warmup,
+				measure,
+				drain: completed_phase(drain_elapsed),
+				cleanup,
+			},
+			throughput,
+			latency,
+			validation,
+			drain: Some(SteadyStateDrain {
+				elapsed_ms: drain_elapsed.as_secs_f64() * 1000.0,
+				timed_out: false,
+			}),
+			operation_result: result,
+		})
+	}
+
+	async fn load_steady_state_dataset<C>(
+		&self,
+		clients: &[Arc<C>],
+		kp: KeyProvider,
+		vp: ValueProvider,
+		records: u32,
+	) -> Result<()>
+	where
+		C: BenchmarkClient + Send + Sync,
+	{
+		let current = Arc::new(AtomicU32::new(0));
+		let mut tasks = JoinSet::new();
+		for client in clients {
+			for _ in 0..self.threads {
+				let client = client.clone();
+				let current = current.clone();
+				let mut kp = kp;
+				let mut vp = vp.clone();
+				tasks.spawn(async move {
+					loop {
+						let key = current.fetch_add(1, Ordering::Relaxed);
+						if key >= records {
+							break;
+						}
+						let value = vp.generate_value();
+						client.create(key, value, &mut kp).await?;
+					}
+					Ok::<_, anyhow::Error>(())
+				});
+			}
+		}
+		while let Some(result) = tasks.join_next().await {
+			result??;
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn run_steady_state_window<C>(
+		&self,
+		clients: &[Arc<C>],
+		kp: KeyProvider,
+		vp: ValueProvider,
+		config: &SteadyStateConfig,
+		workload: SteadyStateWorkload,
+		duration: Duration,
+		record: bool,
+		start_op_index: u64,
+	) -> Result<SteadyStateMeasurement>
+	where
+		C: BenchmarkClient + Send + Sync,
+	{
+		let window_start = Instant::now();
+		let deadline = window_start + duration;
+		let sequence = Arc::new(AtomicU64::new(0));
+		let completed = Arc::new(AtomicU64::new(0));
+		let read_hits = Arc::new(AtomicU64::new(0));
+		let read_misses = Arc::new(AtomicU64::new(0));
+		let updates = Arc::new(AtomicU64::new(0));
+		let creates = Arc::new(AtomicU64::new(0));
+		let cleanup_upper = Arc::new(AtomicU64::new(start_op_index));
+		let scans = Arc::new(AtomicU64::new(0));
+		let latency_samples = Arc::new(AtomicU64::new(0));
+		let errors = Arc::new(AtomicU64::new(0));
+		let scan_count_errors = Arc::new(AtomicU64::new(0));
+		let failure_reason = Arc::new(Mutex::new(None::<String>));
+		let windows = Arc::new(Mutex::new(Vec::<u64>::new()));
+		let metric = record.then(|| OperationMetric::new(self.pid, 0));
+		let mut tasks = JoinSet::new();
+		for (client_index, client) in clients.iter().cloned().enumerate() {
+			for thread_index in 0..self.threads {
+				let worker_index = client_index as u64 * self.threads as u64 + thread_index as u64;
+				let client = client.clone();
+				let sequence = sequence.clone();
+				let completed = completed.clone();
+				let read_hits = read_hits.clone();
+				let read_misses = read_misses.clone();
+				let updates = updates.clone();
+				let creates = creates.clone();
+				let cleanup_upper = cleanup_upper.clone();
+				let scans = scans.clone();
+				let latency_samples = latency_samples.clone();
+				let errors = errors.clone();
+				let scan_count_errors = scan_count_errors.clone();
+				let failure_reason = failure_reason.clone();
+				let windows = windows.clone();
+				let mut kp = kp;
+				let mut vp = vp.clone();
+				let config = config.clone();
+				let mut selector = KeySelector::new(&config, workload, worker_index);
+				let operation_timeout = self.operation_timeout;
+				tasks.spawn(async move {
+					let mut histogram = Histogram::new(3)?;
+					while Instant::now() < deadline {
+						let op_index = sequence.fetch_add(1, Ordering::Relaxed);
+						let op = workload.operation_at(&config, op_index);
+						let time = Instant::now();
+						let op_result = tokio::time::timeout(operation_timeout, async {
+							match op {
+								SteadyStateOperation::Create => {
+									let key_index = start_op_index
+										.checked_add(op_index)
+										.context("sustained_ingest exceeded u64 key space")?;
+									let key = u32::try_from(key_index)
+										.context("sustained_ingest exceeded u32 key space")?;
+									cleanup_upper.fetch_max(key_index + 1, Ordering::Relaxed);
+									let value = vp.generate_value();
+									client.create(key, value, &mut kp).await?;
+									creates.fetch_add(1, Ordering::Relaxed);
+									Ok(())
+								}
+								SteadyStateOperation::Read => {
+									if workload.expects_missing_reads() {
+										let key = selector.next_missing_key()?;
+										match client.read(key, &mut kp).await {
+											Ok(_) => {
+												read_hits.fetch_add(1, Ordering::Relaxed);
+												Err(anyhow::anyhow!(
+													"steady-state {} expected missing key {key}",
+													workload.name()
+												))
+											}
+											Err(_) => {
+												read_misses.fetch_add(1, Ordering::Relaxed);
+												Ok(())
+											}
+										}
+									} else {
+										let key = selector.next_key();
+										match client.read(key, &mut kp).await {
+											Ok(_) => {
+												read_hits.fetch_add(1, Ordering::Relaxed);
+												Ok(())
+											}
+											Err(e) => {
+												read_misses.fetch_add(1, Ordering::Relaxed);
+												Err(e)
+											}
+										}
+									}
+								}
+								SteadyStateOperation::Update => {
+									let key = selector.next_key();
+									let value = vp.generate_value();
+									client.update(key, value, &mut kp).await?;
+									updates.fetch_add(1, Ordering::Relaxed);
+									Ok(())
+								}
+								SteadyStateOperation::Scan => {
+									let scan = selector.next_scan();
+									client.scan(&scan, &kp, ScanContext::WithoutIndex).await?;
+									scans.fetch_add(1, Ordering::Relaxed);
+									Ok(())
+								}
+							}
+						})
+						.await;
+						let op_result = match op_result {
+							Ok(result) => result,
+							Err(_) => {
+								Err(anyhow::anyhow!("steady-state {} timed out", workload.name()))
+							}
+						};
+						if let Err(e) = op_result {
+							errors.fetch_add(1, Ordering::Relaxed);
+							if matches!(op, SteadyStateOperation::Scan) {
+								scan_count_errors.fetch_add(1, Ordering::Relaxed);
+							}
+							if let Ok(mut failure_reason) = failure_reason.lock()
+								&& failure_reason.is_none()
+							{
+								*failure_reason = Some(e.to_string());
+							}
+							break;
+						}
+						let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+						if record && op_index.is_multiple_of(config.latency_sample_every) {
+							if let Err(e) = histogram.record(time.elapsed().as_micros() as u64) {
+								errors.fetch_add(1, Ordering::Relaxed);
+								if let Ok(mut failure_reason) = failure_reason.lock()
+									&& failure_reason.is_none()
+								{
+									*failure_reason = Some(e.to_string());
+								}
+								break;
+							}
+							latency_samples.fetch_add(1, Ordering::Relaxed);
+						}
+						if record {
+							let bucket = time.duration_since(window_start).as_secs() as usize;
+							if let Ok(mut windows) = windows.lock() {
+								if windows.len() <= bucket {
+									windows.resize(bucket + 1, 0);
+								}
+								windows[bucket] += 1;
+							}
+						}
+						let _ = done;
+					}
+					Ok::<_, anyhow::Error>(histogram)
+				});
+			}
+		}
+		let mut global_histogram = Histogram::new(3)?;
+		while let Some(result) = tasks.join_next().await {
+			global_histogram.add(result??)?;
+		}
+		let completed = completed.load(Ordering::Relaxed);
+		let result = metric.map(|mut metric| {
+			metric.set_samples(completed);
+			OperationResult::new(metric, global_histogram)
+		});
+		Ok(SteadyStateMeasurement {
+			completed,
+			read_hits: read_hits.load(Ordering::Relaxed),
+			read_misses: read_misses.load(Ordering::Relaxed),
+			updates: updates.load(Ordering::Relaxed),
+			creates: creates.load(Ordering::Relaxed),
+			scans: scans.load(Ordering::Relaxed),
+			errors: errors.load(Ordering::Relaxed),
+			scan_count_errors: scan_count_errors.load(Ordering::Relaxed),
+			latency_samples: latency_samples.load(Ordering::Relaxed),
+			cleanup_upper: cleanup_upper.load(Ordering::Relaxed),
+			failure_reason: failure_reason.lock().ok().and_then(|reason| reason.clone()),
+			per_second_windows: windows.lock().map(|w| w.clone()).unwrap_or_default(),
+			result,
+		})
+	}
+
+	async fn reset_steady_state_row<C>(
+		&self,
+		clients: &[Arc<C>],
+		kp: KeyProvider,
+		config: &SteadyStateConfig,
+		workload: SteadyStateWorkload,
+		completed_operations: u64,
+	) -> Result<()>
+	where
+		C: BenchmarkClient + Send + Sync,
+	{
+		let upper = match workload {
+			SteadyStateWorkload::SustainedIngest => u32::try_from(completed_operations)
+				.context("sustained_ingest cleanup exceeded u32 key space")?,
+			_ => config.records,
+		};
+		if upper == 0 {
+			return Ok(());
+		}
+		let mut kp = kp;
+		clients[0].reset_steady_state(upper, &mut kp).await
 	}
 
 	/// Build the held-out [`VectorQuerySet`] for a vector-search scan.
@@ -850,7 +1387,7 @@ impl Benchmark {
 		// Store the worker tasks in a join set so failures can stop the operation promptly.
 		let mut tasks = JoinSet::new();
 		// Measure the starting time
-		let metric = OperationMetric::new(self.pid, samples);
+		let metric = OperationMetric::new(self.pid, samples as u64);
 		// Loop over the clients
 		for (client, _) in clients.iter().cloned().zip(1..) {
 			// Loop over the threads
@@ -1072,6 +1609,889 @@ impl Benchmark {
 			histogram.record(time.elapsed().as_micros() as u64)?;
 		}
 		Ok(histogram)
+	}
+}
+
+#[derive(Clone)]
+struct SteadyStateConfig {
+	records: u32,
+	warmup: Duration,
+	measurement: Duration,
+	latency_sample_every: u64,
+	seed: u64,
+	zipfian_exponent: f64,
+	bench_spec: Option<String>,
+	operation_mix: Option<String>,
+	operation_schedule: Option<Vec<SteadyStateOperation>>,
+	operation_mix_period: u32,
+}
+
+impl SteadyStateConfig {
+	fn from_benchmark(benchmark: &Benchmark) -> Result<Self> {
+		if benchmark.operation_mix_period == 0 {
+			bail!("--operation-mix-period must be greater than 0");
+		}
+		if benchmark.operation_mix.is_some()
+			&& benchmark.operation_mix_period > MAX_OPERATION_MIX_PERIOD
+		{
+			bail!(
+				"--operation-mix-period cannot exceed {MAX_OPERATION_MIX_PERIOD} when --operation-mix is set"
+			);
+		}
+		let (records, warmup, measurement, latency_sample_every) =
+			match benchmark.steady_state_preset {
+				SteadyStatePreset::Smoke => (benchmark.samples, 0, 1, 1),
+				SteadyStatePreset::Default => (benchmark.samples, 30, 120, 100),
+				SteadyStatePreset::Large => (benchmark.samples, 60, 300, 100),
+			};
+		let operation_schedule = benchmark
+			.operation_mix
+			.as_deref()
+			.map(|spec| parse_operation_mix(spec, benchmark.operation_mix_period))
+			.transpose()?;
+		Ok(Self {
+			records,
+			warmup: Duration::from_secs(benchmark.warmup_secs.unwrap_or(warmup)),
+			measurement: Duration::from_secs(benchmark.measurement_secs.unwrap_or(measurement)),
+			latency_sample_every: benchmark
+				.latency_sample_every
+				.unwrap_or(latency_sample_every)
+				.max(1),
+			seed: benchmark.seed,
+			zipfian_exponent: benchmark.zipfian_exponent,
+			bench_spec: benchmark.steady_state_benches.clone(),
+			operation_mix: benchmark.operation_mix.clone(),
+			operation_schedule,
+			operation_mix_period: benchmark.operation_mix_period,
+		})
+	}
+
+	fn workloads(&self) -> Result<Vec<SteadyStateWorkload>> {
+		let Some(spec) = self.bench_spec.as_deref() else {
+			return Ok(DEFAULT_STEADY_STATE_WORKLOADS.to_vec());
+		};
+		let workloads: Vec<_> = spec
+			.split(',')
+			.map(str::trim)
+			.filter(|name| !name.is_empty())
+			.map(SteadyStateWorkload::from_name)
+			.collect::<Result<_>>()?;
+		if self.operation_schedule.is_none()
+			&& workloads.contains(&SteadyStateWorkload::BalancedZipfian)
+			&& !self.operation_mix_period.is_multiple_of(2)
+		{
+			bail!(
+				"balanced_zipfian requires an even --operation-mix-period for exact read=0.5,update=0.5"
+			);
+		}
+		if self.operation_schedule.is_none()
+			&& workloads.iter().any(|workload| {
+				matches!(
+					workload,
+					SteadyStateWorkload::ReadHeavyZipfian | SteadyStateWorkload::UpdateHeavyZipfian
+				)
+			}) && !self.operation_mix_period.is_multiple_of(20)
+		{
+			bail!(
+				"read_heavy_zipfian and update_heavy_zipfian require --operation-mix-period to be a multiple of 20 for exact 95/5 mixes"
+			);
+		}
+		if self
+			.operation_schedule
+			.as_ref()
+			.is_some_and(|schedule| schedule.contains(&SteadyStateOperation::Create))
+			&& workloads.iter().any(|workload| *workload != SteadyStateWorkload::SustainedIngest)
+		{
+			bail!(
+				"custom steady-state operation mixes may include create only for sustained_ingest"
+			);
+		}
+		if let Some(schedule) = &self.operation_schedule {
+			for workload in &workloads {
+				workload.validate_operation_schedule(schedule)?;
+			}
+		}
+		Ok(workloads)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SteadyStateWorkload {
+	BalancedZipfian,
+	ReadHeavyZipfian,
+	UpdateHeavyZipfian,
+	PointReadZipfian,
+	PointReadMissingInRange,
+	RangeScanUniform,
+	SustainedIngest,
+}
+
+impl SteadyStateWorkload {
+	fn name(self) -> &'static str {
+		match self {
+			Self::BalancedZipfian => "balanced_zipfian",
+			Self::ReadHeavyZipfian => "read_heavy_zipfian",
+			Self::UpdateHeavyZipfian => "update_heavy_zipfian",
+			Self::PointReadZipfian => "point_read_zipfian",
+			Self::PointReadMissingInRange => "point_read_missing_in_range",
+			Self::RangeScanUniform => "range_scan_uniform",
+			Self::SustainedIngest => "sustained_ingest",
+		}
+	}
+
+	fn from_name(name: &str) -> Result<Self> {
+		match name {
+			"balanced_zipfian" => Ok(Self::BalancedZipfian),
+			"read_heavy_zipfian" => Ok(Self::ReadHeavyZipfian),
+			"update_heavy_zipfian" => Ok(Self::UpdateHeavyZipfian),
+			"point_read_zipfian" => Ok(Self::PointReadZipfian),
+			"point_read_missing_in_range" => Ok(Self::PointReadMissingInRange),
+			"range_scan_uniform" => Ok(Self::RangeScanUniform),
+			"sustained_ingest" => Ok(Self::SustainedIngest),
+			other => bail!("unsupported steady-state workload `{other}`"),
+		}
+	}
+
+	fn requires_prepared_dataset(self) -> bool {
+		!matches!(self, Self::SustainedIngest)
+	}
+
+	fn operation_at(self, config: &SteadyStateConfig, op_index: u64) -> SteadyStateOperation {
+		if let Some(schedule) = &config.operation_schedule {
+			return schedule[(op_index % schedule.len() as u64) as usize];
+		}
+		match self {
+			Self::BalancedZipfian => {
+				let period_slot = op_index % u64::from(config.operation_mix_period);
+				let half = u64::from(config.operation_mix_period / 2);
+				if period_slot < half {
+					SteadyStateOperation::Read
+				} else {
+					SteadyStateOperation::Update
+				}
+			}
+			Self::ReadHeavyZipfian => {
+				let period_slot = op_index % u64::from(config.operation_mix_period);
+				let read_slots = u64::from(config.operation_mix_period) * 19 / 20;
+				if period_slot < read_slots {
+					SteadyStateOperation::Read
+				} else {
+					SteadyStateOperation::Update
+				}
+			}
+			Self::UpdateHeavyZipfian => {
+				let period_slot = op_index % u64::from(config.operation_mix_period);
+				let read_slots = u64::from(config.operation_mix_period / 20);
+				if period_slot < read_slots {
+					SteadyStateOperation::Read
+				} else {
+					SteadyStateOperation::Update
+				}
+			}
+			Self::PointReadZipfian => SteadyStateOperation::Read,
+			Self::PointReadMissingInRange => SteadyStateOperation::Read,
+			Self::RangeScanUniform => SteadyStateOperation::Scan,
+			Self::SustainedIngest => SteadyStateOperation::Create,
+		}
+	}
+
+	fn operation_mix(self, config: &SteadyStateConfig) -> String {
+		if let Some(spec) = &config.operation_mix {
+			return spec.clone();
+		}
+		match self {
+			Self::BalancedZipfian => "read=0.5,update=0.5".to_string(),
+			Self::ReadHeavyZipfian => "read=0.95,update=0.05".to_string(),
+			Self::UpdateHeavyZipfian => "read=0.05,update=0.95".to_string(),
+			Self::PointReadZipfian => "read=1.0".to_string(),
+			Self::PointReadMissingInRange => "read=1.0".to_string(),
+			Self::RangeScanUniform => "scan=1.0".to_string(),
+			Self::SustainedIngest => "create=1.0".to_string(),
+		}
+	}
+
+	fn key_selection(self) -> &'static str {
+		match self {
+			Self::PointReadMissingInRange => "scrambled_zipfian_missing_range",
+			Self::RangeScanUniform => "uniform_positional",
+			Self::SustainedIngest => "unique_sequential",
+			_ => "scrambled_zipfian",
+		}
+	}
+
+	fn validate_operation_schedule(self, schedule: &[SteadyStateOperation]) -> Result<()> {
+		let valid = match self {
+			Self::SustainedIngest => {
+				schedule.iter().all(|op| matches!(op, SteadyStateOperation::Create))
+			}
+			Self::RangeScanUniform => {
+				schedule.iter().all(|op| matches!(op, SteadyStateOperation::Scan))
+			}
+			Self::BalancedZipfian
+			| Self::ReadHeavyZipfian
+			| Self::UpdateHeavyZipfian
+			| Self::PointReadZipfian => schedule
+				.iter()
+				.all(|op| matches!(op, SteadyStateOperation::Read | SteadyStateOperation::Update)),
+			Self::PointReadMissingInRange => {
+				schedule.iter().all(|op| matches!(op, SteadyStateOperation::Read))
+			}
+		};
+		if !valid {
+			bail!(
+				"custom steady-state operation mix is incompatible with {} key-selection contract",
+				self.name()
+			);
+		}
+		Ok(())
+	}
+
+	fn task(self, benchmark: &Benchmark, config: &SteadyStateConfig) -> SteadyStateTask {
+		SteadyStateTask {
+			records: config.records,
+			clients: benchmark.clients,
+			threads: benchmark.threads,
+			warmup_secs: config.warmup.as_secs(),
+			measurement_secs: config.measurement.as_secs(),
+			latency_sample_every: config.latency_sample_every,
+			seed: config.seed,
+			worker_seed_derivation: "splitmix64(seed ^ worker_index)",
+			operation_mix: self.operation_mix(config),
+			operation_mix_period: config.operation_mix_period,
+			key_selection: self.key_selection(),
+			zipfian_exponent: config.zipfian_exponent,
+		}
+	}
+
+	fn expected_mix_prefix(self, config: &SteadyStateConfig, completed: u64) -> String {
+		let mut counts = SteadyStateCounts::default();
+		for idx in 0..completed {
+			counts.add(self.operation_at(config, idx));
+		}
+		counts.to_mix_string()
+	}
+
+	fn expects_missing_reads(self) -> bool {
+		matches!(self, Self::PointReadMissingInRange)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SteadyStateOperation {
+	Create,
+	Read,
+	Update,
+	Scan,
+}
+
+#[derive(Default)]
+struct SteadyStateCounts {
+	creates: u64,
+	reads: u64,
+	updates: u64,
+	scans: u64,
+}
+
+impl SteadyStateCounts {
+	fn add(&mut self, op: SteadyStateOperation) {
+		match op {
+			SteadyStateOperation::Create => self.creates += 1,
+			SteadyStateOperation::Read => self.reads += 1,
+			SteadyStateOperation::Update => self.updates += 1,
+			SteadyStateOperation::Scan => self.scans += 1,
+		}
+	}
+
+	fn to_mix_string(&self) -> String {
+		let mut parts = Vec::new();
+		if self.creates > 0 {
+			parts.push(format!("create={}", self.creates));
+		}
+		if self.reads > 0 {
+			parts.push(format!("read={}", self.reads));
+		}
+		if self.updates > 0 {
+			parts.push(format!("update={}", self.updates));
+		}
+		if self.scans > 0 {
+			parts.push(format!("scan={}", self.scans));
+		}
+		parts.join(",")
+	}
+}
+
+#[derive(Default)]
+struct SteadyStateMeasurement {
+	completed: u64,
+	read_hits: u64,
+	read_misses: u64,
+	updates: u64,
+	creates: u64,
+	scans: u64,
+	errors: u64,
+	scan_count_errors: u64,
+	latency_samples: u64,
+	cleanup_upper: u64,
+	failure_reason: Option<String>,
+	per_second_windows: Vec<u64>,
+	result: Option<OperationResult>,
+}
+
+impl SteadyStateMeasurement {
+	fn observed_mix(&self) -> String {
+		SteadyStateCounts {
+			creates: self.creates,
+			reads: self.read_hits + self.read_misses,
+			updates: self.updates,
+			scans: self.scans,
+		}
+		.to_mix_string()
+	}
+}
+
+struct KeySelector {
+	records: u32,
+	scan_width: usize,
+	rng: u64,
+	zipf_cdf: Vec<f64>,
+	scrambled_keys: Vec<u32>,
+}
+
+impl KeySelector {
+	fn new(config: &SteadyStateConfig, workload: SteadyStateWorkload, worker_index: u64) -> Self {
+		let rng = splitmix64(config.seed ^ worker_index);
+		let uses_zipfian = matches!(
+			workload,
+			SteadyStateWorkload::BalancedZipfian
+				| SteadyStateWorkload::ReadHeavyZipfian
+				| SteadyStateWorkload::UpdateHeavyZipfian
+				| SteadyStateWorkload::PointReadZipfian
+				| SteadyStateWorkload::PointReadMissingInRange
+		);
+		let zipf_cdf = if uses_zipfian {
+			build_zipf_cdf(config.records, config.zipfian_exponent)
+		} else {
+			Vec::new()
+		};
+		let scrambled_keys = if uses_zipfian {
+			build_scrambled_keys(config.records, config.seed)
+		} else {
+			Vec::new()
+		};
+		Self {
+			records: config.records,
+			scan_width: 100,
+			rng,
+			zipf_cdf,
+			scrambled_keys,
+		}
+	}
+
+	fn next_key(&mut self) -> u32 {
+		let rank = if self.zipf_cdf.is_empty() {
+			self.uniform_u32(self.records.max(1))
+		} else {
+			let sample = self.uniform_f64();
+			self.zipf_cdf
+				.partition_point(|p| *p < sample)
+				.min(self.zipf_cdf.len().saturating_sub(1)) as u32
+		};
+		if self.scrambled_keys.is_empty() {
+			rank.min(self.records.saturating_sub(1))
+		} else {
+			self.scrambled_keys[rank as usize]
+		}
+	}
+
+	fn next_missing_key(&mut self) -> Result<u32> {
+		self.records
+			.checked_add(self.next_key())
+			.context("missing-read key range exceeded u32 key space")
+	}
+
+	fn next_scan(&mut self) -> Scan {
+		let max_start = self.records.saturating_sub(self.scan_width as u32);
+		let start = self.uniform_u32(max_start.saturating_add(1)) as usize;
+		Scan {
+			id: "range_scan_uniform".to_string(),
+			spec_group: 0,
+			multi_run_spec: false,
+			name: "range_scan_uniform".to_string(),
+			iterations: None,
+			condition: None,
+			order_by: None,
+			start: Some(start),
+			limit: Some(self.scan_width),
+			expect: Some(self.scan_width.min(self.records as usize)),
+			projection: Some("ID".to_string()),
+			with_index: None,
+			with_writes: Vec::new(),
+			vector_query: None,
+		}
+	}
+
+	fn uniform_u32(&mut self, upper: u32) -> u32 {
+		if upper == 0 {
+			return 0;
+		}
+		(self.next_u64() % upper as u64) as u32
+	}
+
+	fn uniform_f64(&mut self) -> f64 {
+		const DENOMINATOR: f64 = u64::MAX as f64;
+		self.next_u64() as f64 / DENOMINATOR
+	}
+
+	fn next_u64(&mut self) -> u64 {
+		self.rng = splitmix64(self.rng);
+		self.rng
+	}
+}
+
+fn build_zipf_cdf(records: u32, exponent: f64) -> Vec<f64> {
+	let records = records.max(1) as usize;
+	let mut weights = Vec::with_capacity(records);
+	let mut total = 0.0;
+	for rank in 1..=records {
+		let weight = 1.0 / (rank as f64).powf(exponent);
+		total += weight;
+		weights.push(total);
+	}
+	for value in &mut weights {
+		*value /= total;
+	}
+	weights
+}
+
+fn build_scrambled_keys(records: u32, seed: u64) -> Vec<u32> {
+	let records = records.max(1);
+	let mut keys: Vec<_> = (0..records).collect();
+	let mut rng = splitmix64(seed ^ 0xD1B5_4A32_D192_ED03);
+	for i in (1..keys.len()).rev() {
+		rng = splitmix64(rng);
+		keys.swap(i, (rng as usize) % (i + 1));
+	}
+	if keys.len() > 1 && keys[0] == 0 {
+		keys.swap(0, 1);
+	}
+	keys
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+	value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+	let mut z = value;
+	z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+	z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+	z ^ (z >> 31)
+}
+
+fn parse_operation_mix(spec: &str, period: u32) -> Result<Vec<SteadyStateOperation>> {
+	if period > MAX_OPERATION_MIX_PERIOD {
+		bail!("operation mix period cannot exceed {MAX_OPERATION_MIX_PERIOD}");
+	}
+	let mut total = 0.0;
+	let mut schedule = Vec::new();
+	for part in spec.split(',') {
+		let Some((name, value)) = part.split_once('=') else {
+			bail!("operation mix part `{part}` must use name=value");
+		};
+		let op = match name {
+			"read" => SteadyStateOperation::Read,
+			"update" => SteadyStateOperation::Update,
+			"create" => SteadyStateOperation::Create,
+			"scan" => SteadyStateOperation::Scan,
+			other => bail!("unsupported operation `{other}` in operation mix"),
+		};
+		let ratio = value.parse::<f64>()?;
+		if !ratio.is_finite() || ratio <= 0.0 {
+			bail!("operation mix part `{part}` must be a positive finite ratio");
+		}
+		total += ratio;
+		let count = ratio * period as f64;
+		if (count.round() - count).abs() > 0.000_001 {
+			bail!("operation mix part `{part}` cannot be represented exactly by period {period}");
+		}
+		schedule.extend(std::iter::repeat_n(op, count.round() as usize));
+	}
+	if (total - 1.0).abs() > 0.000_001 {
+		bail!("operation mix must sum to 1.0");
+	}
+	if schedule.len() != period as usize {
+		bail!("operation mix expands to {} slots, expected {period}", schedule.len());
+	}
+	Ok(schedule)
+}
+
+fn completed_phase(elapsed: Duration) -> SteadyStatePhase {
+	SteadyStatePhase {
+		elapsed_ms: elapsed.as_secs_f64() * 1000.0,
+		status: SteadyStateStatus::Completed,
+	}
+}
+
+fn unsupported_steady_state_row(
+	benchmark: &Benchmark,
+	database: Option<String>,
+	config: &SteadyStateConfig,
+	workload: SteadyStateWorkload,
+	error: anyhow::Error,
+) -> SteadyStateResult {
+	let phase = SteadyStatePhase {
+		elapsed_ms: 0.0,
+		status: SteadyStateStatus::Unsupported,
+	};
+	SteadyStateResult {
+		name: workload.name().to_string(),
+		suite: "steady-state",
+		database,
+		status: SteadyStateStatus::Unsupported,
+		unsupported_reason: Some(error.to_string()),
+		failure_reason: None,
+		sync: benchmark.sync,
+		task: workload.task(benchmark, config),
+		phases: SteadyStatePhases {
+			prepare: phase.clone(),
+			warmup: phase.clone(),
+			measure: phase.clone(),
+			drain: phase.clone(),
+			cleanup: phase,
+		},
+		throughput: None,
+		latency: None,
+		validation: None,
+		drain: None,
+		operation_result: None,
+	}
+}
+
+fn failed_steady_state_row(
+	benchmark: &Benchmark,
+	database: Option<String>,
+	config: &SteadyStateConfig,
+	workload: SteadyStateWorkload,
+	error: anyhow::Error,
+) -> SteadyStateResult {
+	let phase = SteadyStatePhase {
+		elapsed_ms: 0.0,
+		status: SteadyStateStatus::Failed,
+	};
+	SteadyStateResult {
+		name: workload.name().to_string(),
+		suite: "steady-state",
+		database,
+		status: SteadyStateStatus::Failed,
+		unsupported_reason: None,
+		failure_reason: Some(error.to_string()),
+		sync: benchmark.sync,
+		task: workload.task(benchmark, config),
+		phases: SteadyStatePhases {
+			prepare: phase.clone(),
+			warmup: phase.clone(),
+			measure: phase.clone(),
+			drain: phase.clone(),
+			cleanup: phase,
+		},
+		throughput: None,
+		latency: None,
+		validation: Some(SteadyStateValidation {
+			errors: 1,
+			read_hits: 0,
+			read_misses: 0,
+			updates: 0,
+			scan_count_errors: 0,
+			observed_mix: String::new(),
+			expected_mix_prefix: workload.expected_mix_prefix(config, 0),
+		}),
+		drain: None,
+		operation_result: None,
+	}
+}
+
+#[cfg(test)]
+mod steady_state_tests {
+	use super::*;
+
+	#[test]
+	fn operation_mix_requires_exact_period() {
+		let err = parse_operation_mix("read=0.333,update=0.667", 100).unwrap_err();
+		assert!(err.to_string().contains("cannot be represented exactly"));
+	}
+
+	#[test]
+	fn operation_mix_builds_canonical_schedule() -> Result<()> {
+		let schedule = parse_operation_mix("read=0.5,update=0.5", 10)?;
+		assert!(matches!(schedule[0], SteadyStateOperation::Read));
+		assert!(matches!(schedule[4], SteadyStateOperation::Read));
+		assert!(matches!(schedule[5], SteadyStateOperation::Update));
+		assert!(matches!(schedule[9], SteadyStateOperation::Update));
+		Ok(())
+	}
+
+	#[test]
+	fn operation_mix_rejects_invalid_ratios() {
+		for spec in ["read=NaN,update=1.0", "read=inf", "read=-1.0,update=2.0", "read=0.0"] {
+			let err = parse_operation_mix(spec, 10).expect_err("invalid ratio fails");
+			assert!(err.to_string().contains("positive finite ratio"));
+		}
+	}
+
+	#[test]
+	fn operation_mix_rejects_huge_period() {
+		let err = parse_operation_mix("read=1.0", MAX_OPERATION_MIX_PERIOD + 1)
+			.expect_err("huge period fails");
+
+		assert!(err.to_string().contains("cannot exceed"));
+	}
+
+	#[test]
+	fn expected_mix_uses_partial_prefix() {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: None,
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 10,
+		};
+		let prefix = SteadyStateWorkload::BalancedZipfian.expected_mix_prefix(&config, 13);
+		assert_eq!(prefix, "read=8,update=5");
+	}
+
+	#[test]
+	fn balanced_zipfian_rejects_odd_period() {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("balanced_zipfian".to_string()),
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 999,
+		};
+		let err = config.workloads().unwrap_err();
+		assert!(err.to_string().contains("requires an even"));
+	}
+
+	#[test]
+	fn default_steady_state_rows_match_gateable_rows() -> Result<()> {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: None,
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 1000,
+		};
+		let rows: Vec<_> = config.workloads()?.into_iter().map(SteadyStateWorkload::name).collect();
+
+		assert_eq!(
+			rows,
+			vec![
+				"balanced_zipfian",
+				"read_heavy_zipfian",
+				"update_heavy_zipfian",
+				"point_read_zipfian",
+				"point_read_missing_in_range",
+				"range_scan_uniform",
+				"sustained_ingest"
+			]
+		);
+		Ok(())
+	}
+
+	#[test]
+	fn multi_row_steady_state_is_allowed() -> Result<()> {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("balanced_zipfian,point_read_zipfian".to_string()),
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 1000,
+		};
+		let workloads = config.workloads()?;
+		assert_eq!(
+			workloads,
+			vec![SteadyStateWorkload::BalancedZipfian, SteadyStateWorkload::PointReadZipfian]
+		);
+		Ok(())
+	}
+
+	#[test]
+	fn follow_up_zipfian_rows_are_allowed() -> Result<()> {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("read_heavy_zipfian,update_heavy_zipfian".to_string()),
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 1000,
+		};
+		let workloads = config.workloads()?;
+
+		assert_eq!(
+			workloads,
+			vec![SteadyStateWorkload::ReadHeavyZipfian, SteadyStateWorkload::UpdateHeavyZipfian]
+		);
+		assert_eq!(
+			SteadyStateWorkload::ReadHeavyZipfian.expected_mix_prefix(&config, 1000),
+			"read=950,update=50"
+		);
+		assert_eq!(
+			SteadyStateWorkload::UpdateHeavyZipfian.expected_mix_prefix(&config, 1000),
+			"read=50,update=950"
+		);
+		Ok(())
+	}
+
+	#[test]
+	fn follow_up_zipfian_rows_use_zipfian_selector() {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: None,
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 1000,
+		};
+
+		let read_heavy = KeySelector::new(&config, SteadyStateWorkload::ReadHeavyZipfian, 0);
+		let update_heavy = KeySelector::new(&config, SteadyStateWorkload::UpdateHeavyZipfian, 0);
+
+		assert!(!read_heavy.zipf_cdf.is_empty());
+		assert!(!update_heavy.zipf_cdf.is_empty());
+		assert!(!read_heavy.scrambled_keys.is_empty());
+		assert_ne!(read_heavy.scrambled_keys[0], 0);
+	}
+
+	#[test]
+	fn follow_up_zipfian_rows_reject_inexact_period() {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("read_heavy_zipfian".to_string()),
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 999,
+		};
+
+		let err = config.workloads().unwrap_err();
+
+		assert!(err.to_string().contains("multiple of 20"));
+	}
+
+	#[test]
+	fn sustained_ingest_rejects_non_create_custom_mix() -> Result<()> {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("sustained_ingest".to_string()),
+			operation_mix: Some("read=1.0".to_string()),
+			operation_schedule: Some(parse_operation_mix("read=1.0", 10)?),
+			operation_mix_period: 10,
+		};
+
+		let err = config.workloads().expect_err("sustained ingest rejects reads");
+
+		assert!(err.to_string().contains("incompatible with sustained_ingest"));
+		Ok(())
+	}
+
+	#[test]
+	fn zipfian_rows_reject_scan_custom_mix() -> Result<()> {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("balanced_zipfian".to_string()),
+			operation_mix: Some("scan=1.0".to_string()),
+			operation_schedule: Some(parse_operation_mix("scan=1.0", 10)?),
+			operation_mix_period: 10,
+		};
+
+		let err = config.workloads().expect_err("zipfian rows reject scans");
+
+		assert!(err.to_string().contains("incompatible with balanced_zipfian"));
+		Ok(())
+	}
+
+	#[test]
+	fn prepared_workload_rejects_custom_create_mix() -> Result<()> {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("balanced_zipfian".to_string()),
+			operation_mix: Some("create=1.0".to_string()),
+			operation_schedule: Some(parse_operation_mix("create=1.0", 10)?),
+			operation_mix_period: 10,
+		};
+
+		let err = config.workloads().expect_err("prepared workloads reject creates");
+
+		assert!(err.to_string().contains("may include create only for sustained_ingest"));
+		Ok(())
+	}
+
+	#[test]
+	fn sustained_ingest_offsets_create_keys_after_warmup() {
+		let config = SteadyStateConfig {
+			records: 100,
+			warmup: Duration::from_secs(1),
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("sustained_ingest".to_string()),
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 1000,
+		};
+		assert!(matches!(
+			SteadyStateWorkload::SustainedIngest.operation_at(&config, 0),
+			SteadyStateOperation::Create
+		));
+		assert_eq!(
+			SteadyStateWorkload::SustainedIngest.expected_mix_prefix(&config, 5),
+			"create=5"
+		);
 	}
 }
 

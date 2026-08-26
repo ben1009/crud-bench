@@ -2,6 +2,7 @@
 
 use crate::benchmark::NOT_SUPPORTED_ERROR;
 use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
+use crate::keyprovider::{IntegerKeyProvider, KeyProvider, StringKeyProvider};
 use crate::value::BenchValue;
 use crate::valueprovider::Columns;
 use crate::{Benchmark, KeyType, Projection, Scan};
@@ -100,6 +101,29 @@ impl BenchmarkClient for ToyKvClient {
 		self.engine.close()?;
 		if !self.reads_only && !self.preserve_db {
 			std::fs::remove_dir_all(DATABASE_DIR).ok();
+		}
+		Ok(())
+	}
+
+	async fn reset_steady_state(&self, upper: u32, kp: &mut KeyProvider) -> Result<()> {
+		if self.reads_only || self.load_only {
+			bail!(NOT_SUPPORTED_ERROR);
+		}
+		for n in 0..upper {
+			match kp {
+				KeyProvider::OrderedInteger(p) => {
+					self.engine.delete(&p.key(n).to_ne_bytes())?;
+				}
+				KeyProvider::UnorderedInteger(p) => {
+					self.engine.delete(&p.key(n).to_ne_bytes())?;
+				}
+				KeyProvider::OrderedString(p) => {
+					self.engine.delete(p.key(n).as_bytes())?;
+				}
+				KeyProvider::UnorderedString(p) => {
+					self.engine.delete(p.key(n).as_bytes())?;
+				}
+			}
 		}
 		Ok(())
 	}

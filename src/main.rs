@@ -2,6 +2,34 @@
 //!
 //! Datastore implementations live in sibling modules; workload loading uses [`crate::config`].
 
+#![cfg_attr(
+	not(any(
+		feature = "arangodb",
+		feature = "dragonfly",
+		feature = "fjall",
+		feature = "keydb",
+		feature = "lmdb",
+		feature = "mariadb",
+		feature = "mdbx",
+		feature = "mongodb",
+		feature = "mysql",
+		feature = "neo4j",
+		feature = "postgres",
+		feature = "redb",
+		feature = "redis",
+		feature = "rocksdb",
+		feature = "scylladb",
+		feature = "slatedb",
+		feature = "sqlite",
+		feature = "surrealdb",
+		feature = "surrealdb2",
+		feature = "surrealkv",
+		feature = "surrealmx",
+		feature = "toykv"
+	)),
+	allow(dead_code)
+)]
+
 use crate::benchmark::Benchmark;
 use crate::config::load_bench_toml;
 use crate::database::Database;
@@ -119,6 +147,46 @@ pub(crate) struct Args {
 	#[arg(long, default_value = "false")]
 	pub(crate) sync: bool,
 
+	/// Benchmark suite to run
+	#[arg(long, value_enum, default_value_t = Suite::Crud)]
+	pub(crate) suite: Suite,
+
+	/// Steady-state workload name, or comma-separated workload names
+	#[arg(long)]
+	pub(crate) bench: Option<String>,
+
+	/// Steady-state scale preset
+	#[arg(long, value_enum, default_value_t = SteadyStatePreset::Default)]
+	pub(crate) preset: SteadyStatePreset,
+
+	/// Steady-state warmup duration in seconds
+	#[arg(long)]
+	pub(crate) warmup_secs: Option<u64>,
+
+	/// Steady-state measurement duration in seconds
+	#[arg(long)]
+	pub(crate) measurement_secs: Option<u64>,
+
+	/// Record one latency sample every N completed operations in steady-state runs
+	#[arg(long)]
+	pub(crate) latency_sample_every: Option<u64>,
+
+	/// Steady-state workload seed
+	#[arg(long, default_value_t = 1)]
+	pub(crate) seed: u64,
+
+	/// Zipfian exponent for steady-state Zipfian workloads
+	#[arg(long, default_value_t = 0.99)]
+	pub(crate) zipfian_exponent: f64,
+
+	/// Steady-state operation mix, e.g. read=0.5,update=0.5
+	#[arg(long)]
+	pub(crate) operation_mix: Option<String>,
+
+	/// Deterministic operation-mix scheduler period
+	#[arg(long, default_value_t = 1000)]
+	pub(crate) operation_mix_period: u32,
+
 	/// Per-operation timeout in seconds
 	#[arg(long, env = "CRUD_BENCH_OPERATION_TIMEOUT", default_value = "1800", value_parser=clap::value_parser!(u64).range(1..))]
 	pub(crate) operation_timeout: u64,
@@ -199,6 +267,19 @@ pub(crate) enum KeyType {
 	String506,
 	/// UUID type 7
 	Uuid,
+}
+
+#[derive(Debug, ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Suite {
+	Crud,
+	SteadyState,
+}
+
+#[derive(Debug, ValueEnum, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SteadyStatePreset {
+	Smoke,
+	Default,
+	Large,
 }
 
 /// Expanded scan benchmarks ready to execute (one [`Scan`] per row after multi-run expansion).
@@ -830,6 +911,14 @@ fn run(args: Args) -> Result<()> {
 				.map(|s| format!("result-{s}.csv"))
 				.unwrap_or_else(|| "result.csv".to_string());
 			res.to_csv(&result_csv_name)?;
+			if !res.steady_state.is_empty() {
+				let sidecar_name = args
+					.name
+					.as_ref()
+					.map(|s| format!("result-{s}-steady-state.csv"))
+					.unwrap_or_else(|| "result-steady-state.csv".to_string());
+				res.to_steady_state_sidecar_csv(&sidecar_name)?;
+			}
 
 			// Write the HTML chart file
 			let result_html_name = args
@@ -889,7 +978,7 @@ fn run(args: Args) -> Result<()> {
 /// Unit and integration-style tests for scan expansion and CLI wiring.
 mod test {
 	use crate::terminal::ColorChoice;
-	use crate::{Args, Database, KeyType, run};
+	use crate::{Args, Database, KeyType, SteadyStatePreset, Suite, run};
 	use anyhow::Result;
 	use serial_test::serial;
 
@@ -906,6 +995,16 @@ mod test {
 			threads: 2,
 			samples: 10000,
 			sync: false,
+			suite: Suite::Crud,
+			bench: None,
+			preset: SteadyStatePreset::Default,
+			warmup_secs: None,
+			measurement_secs: None,
+			latency_sample_every: None,
+			seed: 1,
+			zipfian_exponent: 0.99,
+			operation_mix: None,
+			operation_mix_period: 1000,
 			operation_timeout: 300,
 			persisted: false,
 			optimised: false,
@@ -919,6 +1018,8 @@ mod test {
 			storage_endpoint: "ws://localhost:8000".to_string(),
 			skip_scans: false,
 			skip_batches: false,
+			skip_deletes: false,
+			skip_writes: false,
 			skip_indexes: false,
 			emit_phase_markers: false,
 		})
