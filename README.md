@@ -157,7 +157,7 @@ Options:
       --latency-sample-every <N>               Record one steady-state latency sample every N completed operations
       --seed <SEED>                            Steady-state deterministic key-selection seed
       --zipfian-exponent <ZIPFIAN_EXPONENT>    Steady-state Zipfian exponent
-      --operation-mix <OPERATION_MIX>          Custom steady-state operation mix, for example `read=50,update=50`
+      --operation-mix <OPERATION_MIX>          Custom steady-state operation mix, for example `read=0.5,update=0.5`
       --operation-mix-period <N>               Custom operation mix period
   -h, --help                                   Print help (see more with '--help')
   ```
@@ -168,8 +168,9 @@ status, unsupported/failure reasons, validation counts, latency sample counts,
 drain state, and workload metadata. Use the JSON artifact as the `perf-gate`
 source for steady-state comparisons. Select rows with `--bench`; available
 steady-state rows are `balanced_zipfian`, `read_heavy_zipfian`,
-`update_heavy_zipfian`, `point_read_zipfian`, `range_scan_uniform`, and
-`sustained_ingest`. Omitting `--bench` runs all six default steady-state rows.
+`update_heavy_zipfian`, `point_read_zipfian`, `point_read_missing_in_range`,
+`range_scan_uniform`, and `sustained_ingest`. Omitting `--bench` runs all seven
+default steady-state rows.
 
 For more detailed help information run the following command:
 
@@ -202,12 +203,14 @@ cargo run --release --bin perf-gate -- \
   --current-steady-state-json current-steady-state.json \
   --steady-state-row balanced_zipfian \
   --steady-state-row point_read_zipfian \
+  --steady-state-row point_read_missing_in_range \
   --optional-steady-state-row range_scan_uniform
 ```
 
 Omit `--steady-state-row` to gate the default steady-state rows:
 `balanced_zipfian`, `read_heavy_zipfian`, `update_heavy_zipfian`,
-`point_read_zipfian`, `range_scan_uniform`, and `sustained_ingest`. Optional
+`point_read_zipfian`, `point_read_missing_in_range`, `range_scan_uniform`, and
+`sustained_ingest`. Optional
 steady-state rows are also evaluated, but `unsupported` is allowed for them
 when both artifacts are otherwise comparable.
 

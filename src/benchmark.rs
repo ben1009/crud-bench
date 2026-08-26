@@ -780,13 +780,21 @@ impl Benchmark {
 				.reset_steady_state_row::<C>(clients, kp, &config, workload, config.records as u64)
 				.await
 			{
-				let row = if e.to_string().eq(NOT_SUPPORTED_ERROR) {
-					unsupported_steady_state_row(self, database.clone(), &config, workload, e)
+				if e.to_string().eq(NOT_SUPPORTED_ERROR) {
+					eprintln!(
+						"steady-state pre-run cleanup for {} is unsupported; continuing",
+						workload.name()
+					);
 				} else {
-					failed_steady_state_row(self, database.clone(), &config, workload, e)
-				};
-				results.push(row);
-				continue;
+					results.push(failed_steady_state_row(
+						self,
+						database.clone(),
+						&config,
+						workload,
+						e,
+					));
+					continue;
+				}
 			}
 			let row = match self
 				.run_steady_state_row::<C>(
@@ -1631,13 +1639,6 @@ impl SteadyStateConfig {
 		if benchmark.operation_mix_period == 0 {
 			bail!("--operation-mix-period must be greater than 0");
 		}
-		if benchmark.operation_mix.is_some()
-			&& benchmark.operation_mix_period > MAX_OPERATION_MIX_PERIOD
-		{
-			bail!(
-				"--operation-mix-period cannot exceed {MAX_OPERATION_MIX_PERIOD} when --operation-mix is set"
-			);
-		}
 		let (records, warmup, measurement, latency_sample_every) =
 			match benchmark.steady_state_preset {
 				SteadyStatePreset::Smoke => (benchmark.samples, 0, 1, 1),
@@ -1667,15 +1668,15 @@ impl SteadyStateConfig {
 	}
 
 	fn workloads(&self) -> Result<Vec<SteadyStateWorkload>> {
-		let Some(spec) = self.bench_spec.as_deref() else {
-			return Ok(DEFAULT_STEADY_STATE_WORKLOADS.to_vec());
+		let workloads: Vec<SteadyStateWorkload> = match self.bench_spec.as_deref() {
+			None => DEFAULT_STEADY_STATE_WORKLOADS.to_vec(),
+			Some(spec) => spec
+				.split(',')
+				.map(str::trim)
+				.filter(|name| !name.is_empty())
+				.map(SteadyStateWorkload::from_name)
+				.collect::<Result<_>>()?,
 		};
-		let workloads: Vec<_> = spec
-			.split(',')
-			.map(str::trim)
-			.filter(|name| !name.is_empty())
-			.map(SteadyStateWorkload::from_name)
-			.collect::<Result<_>>()?;
 		if self.operation_schedule.is_none()
 			&& workloads.contains(&SteadyStateWorkload::BalancedZipfian)
 			&& !self.operation_mix_period.is_multiple_of(2)
@@ -1865,8 +1866,42 @@ impl SteadyStateWorkload {
 
 	fn expected_mix_prefix(self, config: &SteadyStateConfig, completed: u64) -> String {
 		let mut counts = SteadyStateCounts::default();
-		for idx in 0..completed {
-			counts.add(self.operation_at(config, idx));
+		let period = config
+			.operation_schedule
+			.as_ref()
+			.map_or(config.operation_mix_period as u64, |schedule| schedule.len() as u64);
+		let full_periods = completed / period;
+		let remainder = (completed % period) as usize;
+		if let Some(schedule) = &config.operation_schedule {
+			for operation in schedule {
+				counts.add_n(*operation, full_periods);
+			}
+			for operation in schedule.iter().take(remainder) {
+				counts.add(*operation);
+			}
+		} else {
+			match self {
+				Self::BalancedZipfian => {
+					let reads_per_period = config.operation_mix_period as u64 / 2;
+					counts.reads = full_periods * reads_per_period;
+					counts.updates = full_periods * reads_per_period;
+				}
+				Self::ReadHeavyZipfian | Self::UpdateHeavyZipfian => {
+					let read_slots = match self {
+						Self::ReadHeavyZipfian => config.operation_mix_period as u64 * 19 / 20,
+						Self::UpdateHeavyZipfian => config.operation_mix_period as u64 / 20,
+						_ => unreachable!(),
+					};
+					let full_reads = full_periods * read_slots;
+					let full_updates = full_periods * (period - read_slots);
+					counts.reads = full_reads;
+					counts.updates = full_updates;
+				}
+				_ => counts.add_n(self.operation_at(config, 0), full_periods),
+			}
+			for operation in 0..remainder as u64 {
+				counts.add(self.operation_at(config, full_periods * period + operation));
+			}
 		}
 		counts.to_mix_string()
 	}
@@ -1893,6 +1928,14 @@ struct SteadyStateCounts {
 }
 
 impl SteadyStateCounts {
+	fn add_n(&mut self, operation: SteadyStateOperation, count: u64) {
+		match operation {
+			SteadyStateOperation::Create => self.creates += count,
+			SteadyStateOperation::Read => self.reads += count,
+			SteadyStateOperation::Update => self.updates += count,
+			SteadyStateOperation::Scan => self.scans += count,
+		}
+	}
 	fn add(&mut self, op: SteadyStateOperation) {
 		match op {
 			SteadyStateOperation::Create => self.creates += 1,

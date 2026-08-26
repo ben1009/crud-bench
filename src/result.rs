@@ -79,6 +79,16 @@ pub(crate) enum SteadyStateStatus {
 	Failed,
 }
 
+impl SteadyStateStatus {
+	pub(crate) fn as_str(self) -> &'static str {
+		match self {
+			Self::Completed => "completed",
+			Self::Unsupported => "unsupported",
+			Self::Failed => "failed",
+		}
+	}
+}
+
 #[derive(Clone, Serialize)]
 pub(crate) struct SteadyStateTask {
 	pub(crate) records: u32,
@@ -541,11 +551,7 @@ impl BenchmarkResult {
 				row.suite.to_string(),
 				row.name.clone(),
 				row.database.clone().unwrap_or_default(),
-				match row.status {
-					SteadyStateStatus::Completed => "completed".to_string(),
-					SteadyStateStatus::Unsupported => "unsupported".to_string(),
-					SteadyStateStatus::Failed => "failed".to_string(),
-				},
+				row.status.as_str().to_string(),
 				row.unsupported_reason.clone().unwrap_or_default(),
 				row.failure_reason.clone().unwrap_or_default(),
 				row.sync.to_string(),

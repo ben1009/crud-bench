@@ -80,6 +80,7 @@ The MVP should implement these rows first:
 | `read_heavy_zipfian` | 95% read, 5% update | scrambled Zipfian, exponent 0.99 | prepared | Cache-heavy churn |
 | `update_heavy_zipfian` | 5% read, 95% update | scrambled Zipfian, exponent 0.99 | prepared | Write-heavy churn |
 | `point_read_zipfian` | 100% read | scrambled Zipfian, exponent 0.99 | prepared | Hot-key read throughput and latency |
+| `point_read_missing_in_range` | 100% missing read | scrambled Zipfian missing-range | prepared | Negative lookup behavior |
 | `range_scan_uniform` | 100% scan | uniform positional start | prepared | Bounded scan throughput and count validation |
 | `sustained_ingest` | 100% create | unique sequential | fresh empty | Steady durable write path |
 
@@ -87,7 +88,6 @@ Later rows:
 
 | Row | Operation mix | Purpose |
 |---|---:|---|
-| `point_read_missing_in_range` | 100% missing read | Negative lookup behavior |
 | `transaction_contention` | parameterized | Serializable transaction contention, only after the adapter API supports it |
 
 Backends that cannot support a row should report the row as skipped with a
@@ -396,8 +396,9 @@ The current default ToyKV vs RocksDB steady-state gate compares:
 2. `read_heavy_zipfian`;
 3. `update_heavy_zipfian`;
 4. `point_read_zipfian`;
-5. `range_scan_uniform`;
-6. `sustained_ingest`.
+5. `point_read_missing_in_range`;
+6. `range_scan_uniform`;
+7. `sustained_ingest`.
 
 Acceptance for a ToyKV storage-engine performance PR:
 
@@ -454,7 +455,7 @@ the accepted benchmark priority.
 
 1. Add `read_heavy_zipfian`. Done in this implementation.
 2. Add `update_heavy_zipfian`. Done in this implementation.
-3. Add `point_read_missing_in_range`.
+3. Add `point_read_missing_in_range`. Done in this implementation.
 4. Add `transaction_contention` after the adapter API supports serializable
    transaction configuration.
 

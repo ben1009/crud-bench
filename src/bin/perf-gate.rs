@@ -69,6 +69,9 @@ struct Args {
 	/// Maximum allowed current-sync OPS regression versus baseline sync.
 	#[arg(long, default_value_t = 5.0)]
 	max_sync_regression_pct: f64,
+	/// Maximum allowed steady-state OPS regression versus the baseline artifact.
+	#[arg(long, default_value_t = 5.0)]
+	max_ops_regression_pct: f64,
 	/// Minimum number of ratio rows that must improve.
 	#[arg(long, default_value_t = 2)]
 	min_ratio_improvements: usize,
@@ -248,7 +251,7 @@ fn main() -> Result<ExitCode> {
 		let cfg = SteadyStateGateConfig {
 			rows,
 			optional_rows: args.optional_steady_state_rows,
-			max_ops_regression_pct: args.max_sync_regression_pct,
+			max_ops_regression_pct: args.max_ops_regression_pct,
 			max_latency_regression_pct: args.max_latency_regression_pct,
 		};
 		let inputs = SteadyStateGateInputs {
@@ -354,8 +357,9 @@ fn parse_steady_state_json<R: Read>(reader: R) -> Result<SteadyStateRows> {
 	let artifact: SteadyStateArtifact = serde_json::from_reader(reader)?;
 	let mut rows = HashMap::new();
 	for row in artifact.steady_state {
-		if rows.insert(row.name.clone(), row).is_some() {
-			bail!("duplicate steady-state row found");
+		let name = row.name.clone();
+		if rows.insert(name.clone(), row).is_some() {
+			bail!("duplicate steady-state row {name:?} found");
 		}
 	}
 	Ok(rows)
@@ -877,7 +881,7 @@ fn validate_config(cfg: &GateConfig) -> Result<()> {
 
 fn validate_steady_state_config(cfg: &SteadyStateGateConfig) -> Result<()> {
 	if cfg.max_ops_regression_pct < 0.0 {
-		bail!("--max-sync-regression-pct cannot be negative");
+		bail!("--max-ops-regression-pct cannot be negative");
 	}
 	if cfg.max_latency_regression_pct < 0.0 {
 		bail!("--max-latency-regression-pct cannot be negative");
@@ -1415,12 +1419,12 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 	}
 
 	#[test]
-	fn steady_state_mode_requires_json_pair() {
-		let err =
+	fn steady_state_mode_accepts_partial_json_parse() {
+		let args =
 			Args::try_parse_from(["perf-gate", "--baseline-steady-state-json", "baseline.json"])
 				.expect("clap accepts partial steady-state mode");
-		assert!(err.baseline_steady_state_json.is_some());
-		assert!(err.current_steady_state_json.is_none());
+		assert!(args.baseline_steady_state_json.is_some());
+		assert!(args.current_steady_state_json.is_none());
 	}
 
 	#[test]

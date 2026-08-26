@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const DATABASE_DIR: &str = "rocksdb";
+const STEADY_STATE_RESET_BATCH_SIZE: usize = 1_000;
 
 /// Calculate RocksDB specific memory allocation
 fn calculate_rocksdb_memory() -> u64 {
@@ -211,25 +212,16 @@ impl BenchmarkClient for RocksDBClient {
 	}
 
 	async fn reset_steady_state(&self, upper: u32, kp: &mut KeyProvider) -> Result<()> {
-		for n in 0..upper {
-			match kp {
-				KeyProvider::OrderedInteger(p) => {
-					let key = p.key(n).to_ne_bytes();
-					self.delete_bytes(&key).await?;
-				}
-				KeyProvider::UnorderedInteger(p) => {
-					let key = p.key(n).to_ne_bytes();
-					self.delete_bytes(&key).await?;
-				}
-				KeyProvider::OrderedString(p) => {
-					let key = p.key(n).into_bytes();
-					self.delete_bytes(&key).await?;
-				}
-				KeyProvider::UnorderedString(p) => {
-					let key = p.key(n).into_bytes();
-					self.delete_bytes(&key).await?;
-				}
-			}
+		let keys: Vec<Vec<u8>> = (0..upper)
+			.map(|n| match kp {
+				KeyProvider::OrderedInteger(p) => p.key(n).to_ne_bytes().to_vec(),
+				KeyProvider::UnorderedInteger(p) => p.key(n).to_ne_bytes().to_vec(),
+				KeyProvider::OrderedString(p) => p.key(n).into_bytes(),
+				KeyProvider::UnorderedString(p) => p.key(n).into_bytes(),
+			})
+			.collect();
+		for chunk in keys.chunks(STEADY_STATE_RESET_BATCH_SIZE) {
+			self.batch_delete_bytes(chunk.iter().cloned()).await?;
 		}
 		Ok(())
 	}

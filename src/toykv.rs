@@ -15,6 +15,7 @@ use toykv::lsm_storage::{KvEngine, LsmStorageOptions, WriteBatchRecord};
 use toykv::vlog::ValueSeparationOptions;
 
 const DATABASE_DIR: &str = "toykv_data";
+const STEADY_STATE_RESET_BATCH_SIZE: usize = 1_000;
 
 fn env_flag(name: &str) -> bool {
 	std::env::var(name).is_ok()
@@ -109,21 +110,20 @@ impl BenchmarkClient for ToyKvClient {
 		if self.reads_only || self.load_only {
 			bail!(NOT_SUPPORTED_ERROR);
 		}
-		for n in 0..upper {
-			match kp {
+		let batch: Vec<WriteBatchRecord<Vec<u8>>> = (0..upper)
+			.map(|n| match kp {
 				KeyProvider::OrderedInteger(p) => {
-					self.engine.delete(&p.key(n).to_ne_bytes())?;
+					WriteBatchRecord::Del(p.key(n).to_ne_bytes().to_vec())
 				}
 				KeyProvider::UnorderedInteger(p) => {
-					self.engine.delete(&p.key(n).to_ne_bytes())?;
+					WriteBatchRecord::Del(p.key(n).to_ne_bytes().to_vec())
 				}
-				KeyProvider::OrderedString(p) => {
-					self.engine.delete(p.key(n).as_bytes())?;
-				}
-				KeyProvider::UnorderedString(p) => {
-					self.engine.delete(p.key(n).as_bytes())?;
-				}
-			}
+				KeyProvider::OrderedString(p) => WriteBatchRecord::Del(p.key(n).into_bytes()),
+				KeyProvider::UnorderedString(p) => WriteBatchRecord::Del(p.key(n).into_bytes()),
+			})
+			.collect();
+		for chunk in batch.chunks(STEADY_STATE_RESET_BATCH_SIZE) {
+			self.engine.write_batch(chunk)?;
 		}
 		Ok(())
 	}

@@ -53,23 +53,33 @@ impl BenchmarkClient for MapClient {
 	type ReadRow = BenchValue;
 
 	async fn reset_steady_state(&self, upper: u32, kp: &mut KeyProvider) -> Result<()> {
+		let integer_keys =
+			matches!(kp, KeyProvider::OrderedInteger(_) | KeyProvider::UnorderedInteger(_));
+		let string_keys =
+			matches!(kp, KeyProvider::OrderedString(_) | KeyProvider::UnorderedString(_));
 		match &self.0 {
 			MapDatabase::Integer(m) => {
+				if !integer_keys {
+					bail!("Invalid KeyProvider variant");
+				}
 				for n in 0..upper {
 					let key = match kp {
 						KeyProvider::OrderedInteger(p) => p.key(n),
 						KeyProvider::UnorderedInteger(p) => p.key(n),
-						_ => bail!("Invalid KeyProvider variant"),
+						_ => unreachable!("key provider variant validated above"),
 					};
 					m.remove(&key);
 				}
 			}
 			MapDatabase::String(m) => {
+				if !string_keys {
+					bail!("Invalid KeyProvider variant");
+				}
 				for n in 0..upper {
 					let key = match kp {
 						KeyProvider::OrderedString(p) => p.key(n),
 						KeyProvider::UnorderedString(p) => p.key(n),
-						_ => bail!("Invalid KeyProvider variant"),
+						_ => unreachable!("key provider variant validated above"),
 					};
 					m.remove(&key);
 				}
