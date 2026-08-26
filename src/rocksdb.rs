@@ -365,11 +365,9 @@ impl RocksDBClient {
 		ro.set_async_io(true);
 		ro.fill_cache(true);
 		// Process the data
-		let res = txn.get_pinned_opt(key, &ro)?;
-		// Check the value exists
-		assert!(res.is_some());
+		let res = txn.get_pinned_opt(key, &ro)?.ok_or_else(|| anyhow::anyhow!("key not found"))?;
 		// Deserialise the value
-		let val = BenchValue::decode(res.unwrap().as_ref())?;
+		let val = BenchValue::decode(res.as_ref())?;
 		// All ok
 		Ok(black_box(val))
 	}
@@ -446,11 +444,10 @@ impl RocksDBClient {
 		// Process the data
 		for key in keys {
 			// Get the current value
-			let res = txn.get_pinned_opt(&key, &ro)?;
-			// Check the value exists
-			assert!(res.is_some());
+			let res =
+				txn.get_pinned_opt(&key, &ro)?.ok_or_else(|| anyhow::anyhow!("key not found"))?;
 			// Deserialise the value
-			let val = BenchValue::decode(res.unwrap().as_ref())?;
+			let val = BenchValue::decode(res.as_ref())?;
 			// Use the value
 			black_box(val);
 		}
@@ -519,8 +516,6 @@ impl RocksDBClient {
 		let mut ro = ReadOptions::default();
 		ro.set_snapshot(&txn.snapshot());
 		ro.set_readahead_size(2 * 1024 * 1024);
-		ro.set_iterate_lower_bound([0u8]);
-		ro.set_iterate_upper_bound([255u8]);
 		ro.set_verify_checksums(false);
 		ro.set_async_io(true);
 		ro.fill_cache(true);

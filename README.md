@@ -214,6 +214,10 @@ Omit `--steady-state-row` to gate the default steady-state rows:
 steady-state rows are also evaluated, but `unsupported` is allowed for them
 when both artifacts are otherwise comparable.
 
+Use `--allow-database-mismatch` when the baseline and current artifacts are
+different backends, such as a ToyKV-versus-RocksDB comparison. The gate still
+requires matching task metadata and sync settings.
+
 ### Comparing `result*.json` files in the browser
 
 Open [`compare/index.html`](compare/index.html) locally (drag and drop benchmark JSON artefacts). Rows and labels match CLI/CSV ordering from [`src/result.rs`](src/result.rs). Nothing is uploaded; ApexCharts loads from jsDelivr (works offline only if that script is cached or vendored beside the HTML file).

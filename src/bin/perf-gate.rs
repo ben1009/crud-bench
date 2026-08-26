@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::Deserialize;
+use serde_json::Value;
 
 const DEFAULT_ROWS: &[&str] =
 	&["put_c", "batch_create_100", "batch_create_1000", "batch_delete_100", "batch_delete_1000"];
@@ -72,6 +73,9 @@ struct Args {
 	/// Maximum allowed steady-state OPS regression versus the baseline artifact.
 	#[arg(long, default_value_t = 5.0)]
 	max_ops_regression_pct: f64,
+	/// Allow baseline and current steady-state artifacts to represent different backends.
+	#[arg(long)]
+	allow_database_mismatch: bool,
 	/// Minimum number of ratio rows that must improve.
 	#[arg(long, default_value_t = 2)]
 	min_ratio_improvements: usize,
@@ -113,6 +117,7 @@ struct SteadyStateGateConfig {
 	optional_rows: Vec<String>,
 	max_ops_regression_pct: f64,
 	max_latency_regression_pct: f64,
+	allow_database_mismatch: bool,
 }
 
 #[derive(Debug)]
@@ -253,6 +258,7 @@ fn main() -> Result<ExitCode> {
 			optional_rows: args.optional_steady_state_rows,
 			max_ops_regression_pct: args.max_ops_regression_pct,
 			max_latency_regression_pct: args.max_latency_regression_pct,
+			allow_database_mismatch: args.allow_database_mismatch,
 		};
 		let inputs = SteadyStateGateInputs {
 			baseline: read_steady_state_json(baseline)?,
@@ -324,6 +330,7 @@ fn uses_steady_state_mode(args: &Args) -> bool {
 		|| args.current_steady_state_json.is_some()
 		|| !args.steady_state_rows.is_empty()
 		|| !args.optional_steady_state_rows.is_empty()
+		|| args.allow_database_mismatch
 }
 
 fn steady_state_rows_to_evaluate(
@@ -589,7 +596,13 @@ fn evaluate_steady_state(
 		let baseline_optional_unsupported =
 			is_optional_unsupported(row_name, &baseline.status, cfg);
 		let current_optional_unsupported = is_optional_unsupported(row_name, &current.status, cfg);
-		validate_steady_state_comparable(row_name, baseline, current, &mut failures);
+		validate_steady_state_comparable(
+			row_name,
+			baseline,
+			current,
+			cfg.allow_database_mismatch,
+			&mut failures,
+		);
 
 		if baseline.status == "completed" && current.status == "completed" {
 			let Some(baseline_throughput) = &baseline.throughput else {
@@ -609,14 +622,20 @@ fn evaluate_steady_state(
 			let p95_delta = percent_change(current_latency.p95_ms, baseline_latency.p95_ms);
 			let p99_delta = percent_change(current_latency.p99_ms, baseline_latency.p99_ms);
 			output.push_str(&format!(
-				"- {row_name}: OPS {:.2} -> {:.2} ({:+.2}%), p95 {:.2} -> {:.2} ms ({:+.2}%), p99 {:.2} -> {:.2} ms ({:+.2}%)\n",
+				"- {row_name}: {} OPS {:.2} -> {} OPS {:.2} ({:+.2}%), {} p95 {:.2} -> {} p95 {:.2} ms ({:+.2}%), {} p99 {:.2} -> {} p99 {:.2} ms ({:+.2}%)\n",
+				database_label(&baseline.database),
 				baseline_throughput.ops_per_sec,
+				database_label(&current.database),
 				current_throughput.ops_per_sec,
 				ops_delta,
+				database_label(&baseline.database),
 				baseline_latency.p95_ms,
+				database_label(&current.database),
 				current_latency.p95_ms,
 				p95_delta,
+				database_label(&baseline.database),
 				baseline_latency.p99_ms,
+				database_label(&current.database),
 				current_latency.p99_ms,
 				p99_delta
 			));
@@ -670,6 +689,10 @@ fn evaluate_steady_state(
 			passed: false,
 		})
 	}
+}
+
+fn database_label(database: &Value) -> &str {
+	database.as_str().unwrap_or("unknown")
 }
 
 fn validate_steady_state_row(
@@ -811,9 +834,10 @@ fn validate_steady_state_comparable(
 	row_name: &str,
 	baseline: &SteadyStateRow,
 	current: &SteadyStateRow,
+	allow_database_mismatch: bool,
 	failures: &mut Vec<String>,
 ) {
-	if baseline.database != current.database {
+	if !allow_database_mismatch && baseline.database != current.database {
 		failures.push(format!("{row_name} database differs between baseline and current"));
 	}
 	if baseline.sync != current.sync {
@@ -1184,6 +1208,7 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
 
 		assert!(eval.passed);
+		assert!(eval.report.contains("toykv OPS 1000.00 -> toykv OPS 980.00"));
 		assert!(eval.report.contains("Result: PASS"));
 	}
 
@@ -1323,6 +1348,25 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 		assert!(eval.report.contains("database differs"));
 		assert!(eval.report.contains("sync setting differs"));
 		assert!(eval.report.contains("task metadata differs"));
+	}
+
+	#[test]
+	fn allows_database_mismatch_for_cross_backend_comparison() {
+		let mut cfg = steady_state_cfg(&["balanced_zipfian"]);
+		cfg.allow_database_mismatch = true;
+		let baseline = steady_state_row("balanced_zipfian", 1000.0, 2.0, 4.0);
+		let mut current = baseline.clone();
+		current.database = serde_json::Value::String("rocksdb".into());
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[baseline]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(eval.passed);
+		assert!(eval.report.contains("toykv OPS 1000.00 -> rocksdb OPS 1000.00"));
+		assert!(eval.report.contains("Result: PASS"));
 	}
 
 	#[test]
@@ -1656,6 +1700,7 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 			optional_rows: Vec::new(),
 			max_ops_regression_pct: 5.0,
 			max_latency_regression_pct: 5.0,
+			allow_database_mismatch: false,
 		}
 	}
 

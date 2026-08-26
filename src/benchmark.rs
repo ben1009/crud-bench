@@ -1872,19 +1872,18 @@ impl SteadyStateWorkload {
 			.map_or(config.operation_mix_period as u64, |schedule| schedule.len() as u64);
 		let full_periods = completed / period;
 		let remainder = (completed % period) as usize;
-		if let Some(schedule) = &config.operation_schedule {
+		let add_remainder = if let Some(schedule) = &config.operation_schedule {
 			for operation in schedule {
 				counts.add_n(*operation, full_periods);
 			}
-			for operation in schedule.iter().take(remainder) {
-				counts.add(*operation);
-			}
+			true
 		} else {
 			match self {
 				Self::BalancedZipfian => {
 					let reads_per_period = config.operation_mix_period as u64 / 2;
 					counts.reads = full_periods * reads_per_period;
 					counts.updates = full_periods * reads_per_period;
+					true
 				}
 				Self::ReadHeavyZipfian | Self::UpdateHeavyZipfian => {
 					let read_slots = match self {
@@ -1896,9 +1895,15 @@ impl SteadyStateWorkload {
 					let full_updates = full_periods * (period - read_slots);
 					counts.reads = full_reads;
 					counts.updates = full_updates;
+					true
 				}
-				_ => counts.add_n(self.operation_at(config, 0), full_periods),
+				_ => {
+					counts.add_n(self.operation_at(config, 0), completed);
+					false
+				}
 			}
+		};
+		if add_remainder {
 			for operation in 0..remainder as u64 {
 				counts.add(self.operation_at(config, full_periods * period + operation));
 			}
@@ -2302,6 +2307,14 @@ mod steady_state_tests {
 		};
 		let prefix = SteadyStateWorkload::BalancedZipfian.expected_mix_prefix(&config, 13);
 		assert_eq!(prefix, "read=8,update=5");
+		assert_eq!(
+			SteadyStateWorkload::PointReadZipfian.expected_mix_prefix(&config, 13),
+			"read=13"
+		);
+		assert_eq!(
+			SteadyStateWorkload::SustainedIngest.expected_mix_prefix(&config, 13),
+			"create=13"
+		);
 	}
 
 	#[test]
