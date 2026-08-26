@@ -201,7 +201,6 @@ Use steady-state JSON artifacts for steady-state gates:
 cargo run --release --bin perf-gate -- \
   --baseline-steady-state-json baseline-steady-state.json \
   --current-steady-state-json current-steady-state.json \
-  --allow-database-mismatch \
   --steady-state-row balanced_zipfian \
   --steady-state-row point_read_zipfian \
   --steady-state-row point_read_missing_in_range \
