@@ -17,6 +17,7 @@ const DEFAULT_STEADY_STATE_ROWS: &[&str] = &[
 	"read_heavy_zipfian",
 	"update_heavy_zipfian",
 	"point_read_zipfian",
+	"point_read_uniform",
 	"point_read_missing_in_range",
 	"range_scan_uniform",
 	"sustained_ingest",
@@ -603,6 +604,10 @@ fn evaluate_steady_state(
 			cfg.allow_database_mismatch,
 			&mut failures,
 		);
+		if row_name == "idle" {
+			output.push_str("- idle: no client operations; phase timings only\n");
+			continue;
+		}
 
 		if baseline.status == "completed" && current.status == "completed" {
 			let Some(baseline_throughput) = &baseline.throughput else {
@@ -736,6 +741,37 @@ fn validate_steady_state_row(
 			failures.push(format!("{source} {row_name} has unknown status {other:?}"));
 			return;
 		}
+	}
+	if row_name == "idle" {
+		let Some(validation) = &row.validation else {
+			failures.push(format!("{source} {row_name} is missing validation"));
+			return;
+		};
+		if validation.errors > 0 {
+			failures
+				.push(format!("{source} {row_name} has {} validation errors", validation.errors));
+		}
+		if validation.read_hits != 0
+			|| validation.read_misses != 0
+			|| validation.updates != 0
+			|| validation.scan_count_errors != 0
+		{
+			failures.push(format!("{source} {row_name} reports client operations"));
+		}
+		if validation.observed_mix != "none" || validation.expected_mix_prefix != "none" {
+			failures.push(format!("{source} {row_name} has invalid idle operation mix"));
+		}
+		if row.throughput.is_some() || row.latency.is_some() {
+			failures.push(format!("{source} {row_name} must not report throughput or latency"));
+		}
+		let Some(drain) = &row.drain else {
+			failures.push(format!("{source} {row_name} is missing drain"));
+			return;
+		};
+		if drain.elapsed_ms < 0.0 || !drain.elapsed_ms.is_finite() || drain.timed_out {
+			failures.push(format!("{source} {row_name} has invalid drain"));
+		}
+		return;
 	}
 	let Some(throughput) = &row.throughput else {
 		failures.push(format!("{source} {row_name} is missing throughput"));
@@ -930,9 +966,11 @@ fn is_steady_state_row(row: &str) -> bool {
 				| "read_heavy_zipfian"
 				| "update_heavy_zipfian"
 				| "point_read_zipfian"
+				| "point_read_uniform"
 				| "point_read_missing_in_range"
 				| "range_scan_uniform"
 				| "sustained_ingest"
+				| "idle"
 		)
 }
 
@@ -1348,6 +1386,33 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 		assert!(eval.report.contains("database differs"));
 		assert!(eval.report.contains("sync setting differs"));
 		assert!(eval.report.contains("task metadata differs"));
+	}
+
+	#[test]
+	fn rejects_idle_rows_with_operations_or_metrics() {
+		let cfg = steady_state_cfg(&["idle"]);
+		let mut baseline = steady_state_row("idle", 0.0, 0.0, 0.0);
+		baseline.throughput = None;
+		baseline.latency = None;
+		baseline.validation.as_mut().unwrap().observed_mix = "none".into();
+		baseline.validation.as_mut().unwrap().expected_mix_prefix = "none".into();
+		let mut current = baseline.clone();
+		current.validation.as_mut().unwrap().read_hits = 1;
+		current.throughput = Some(SteadyStateThroughput {
+			completed_operations: 1,
+			ops_per_sec: 1.0,
+			per_second_windows: vec![1.0],
+		});
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[baseline]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(!eval.passed);
+		assert!(eval.report.contains("reports client operations"));
+		assert!(eval.report.contains("must not report throughput or latency"));
 	}
 
 	#[test]
