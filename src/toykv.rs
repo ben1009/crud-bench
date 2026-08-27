@@ -1,12 +1,12 @@
 #![cfg(feature = "toykv")]
 
 use crate::benchmark::NOT_SUPPORTED_ERROR;
-use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
+use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext, TransactionOutcome};
 use crate::keyprovider::{IntegerKeyProvider, KeyProvider, StringKeyProvider};
 use crate::value::BenchValue;
 use crate::valueprovider::Columns;
 use crate::{Benchmark, KeyType, Projection, Scan};
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,7 +56,9 @@ impl BenchmarkEngine<ToyKvClient> for ToyKvClientProvider {
 			num_memtable_limit: 50,
 			compaction_options: compaction_opts,
 			enable_wal: options.sync,
-			serializable: false,
+			serializable: options.steady_state_benches.as_deref().is_some_and(|benches| {
+				benches.split(',').any(|bench| bench.trim() == "transaction_contention")
+			}),
 			value_separation: Some(ValueSeparationOptions {
 				enabled: true,
 				min_value_size: 4 * 1024, // 4KB — match Fjall
@@ -126,6 +128,48 @@ impl BenchmarkClient for ToyKvClient {
 			self.engine.write_batch(chunk)?;
 		}
 		Ok(())
+	}
+
+	async fn transaction_u32(
+		&self,
+		read_keys: Vec<u32>,
+		updates: Vec<(u32, BenchValue)>,
+	) -> Result<TransactionOutcome> {
+		if self.reads_only || self.load_only {
+			bail!(NOT_SUPPORTED_ERROR);
+		}
+		let txn = self.engine.new_txn()?;
+		let update_count =
+			u32::try_from(updates.len()).context("transaction update count exceeded u32")?;
+		let mut read_hits = 0;
+		let mut read_misses = 0;
+		for key in read_keys {
+			match txn.get(&key.to_ne_bytes())? {
+				Some(bytes) => {
+					BenchValue::decode(&bytes)?;
+					read_hits += 1;
+				}
+				None => read_misses += 1,
+			}
+		}
+		for (key, value) in updates {
+			let encoded = value.encode()?;
+			txn.put(&key.to_ne_bytes(), &encoded)?;
+		}
+		match txn.commit() {
+			Ok(()) => Ok(TransactionOutcome::Committed {
+				read_hits,
+				read_misses,
+				updates: update_count,
+			}),
+			Err(error) if error.to_string().contains("serializable conflict") => {
+				Ok(TransactionOutcome::Conflict {
+					read_hits,
+					read_misses,
+				})
+			}
+			Err(error) => Err(error),
+		}
 	}
 
 	async fn create_u32(&self, key: u32, val: BenchValue) -> Result<()> {

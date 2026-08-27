@@ -187,6 +187,22 @@ pub(crate) struct Args {
 	#[arg(long, default_value_t = 1000)]
 	pub(crate) operation_mix_period: u32,
 
+	/// Number of keys used by the transaction contention workload
+	#[arg(long, default_value_t = 128, value_parser=clap::value_parser!(u32).range(1..))]
+	pub(crate) transaction_hot_set: u32,
+
+	/// Number of reads in each transaction contention attempt
+	#[arg(long, default_value_t = 5, value_parser=clap::value_parser!(u32).range(0..))]
+	pub(crate) transaction_reads: u32,
+
+	/// Number of updates in each transaction contention attempt
+	#[arg(long, default_value_t = 5, value_parser=clap::value_parser!(u32).range(1..))]
+	pub(crate) transaction_updates: u32,
+
+	/// Number of retries after an optimistic transaction conflict
+	#[arg(long, default_value_t = 0, value_parser=clap::value_parser!(u32).range(0..))]
+	pub(crate) transaction_retries: u32,
+
 	/// Per-operation timeout in seconds
 	#[arg(long, env = "CRUD_BENCH_OPERATION_TIMEOUT", default_value = "1800", value_parser=clap::value_parser!(u64).range(1..))]
 	pub(crate) operation_timeout: u64,
@@ -1005,6 +1021,10 @@ mod test {
 			zipfian_exponent: 0.99,
 			operation_mix: None,
 			operation_mix_period: 1000,
+			transaction_hot_set: 128,
+			transaction_reads: 5,
+			transaction_updates: 5,
+			transaction_retries: 0,
 			operation_timeout: 300,
 			persisted: false,
 			optimised: false,

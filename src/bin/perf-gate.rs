@@ -178,6 +178,14 @@ struct SteadyStateTask {
 	operation_mix_period: u32,
 	key_selection: String,
 	zipfian_exponent: f64,
+	#[serde(default)]
+	transaction_hot_set: u32,
+	#[serde(default)]
+	transaction_reads: u32,
+	#[serde(default)]
+	transaction_updates: u32,
+	#[serde(default)]
+	transaction_retries: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -220,6 +228,12 @@ struct SteadyStateValidation {
 	scan_count_errors: u64,
 	observed_mix: String,
 	expected_mix_prefix: String,
+	#[serde(default)]
+	transaction_attempts: u64,
+	#[serde(default)]
+	transaction_commits: u64,
+	#[serde(default)]
+	transaction_conflicts: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -624,10 +638,12 @@ fn evaluate_steady_state(
 			};
 			let ops_delta =
 				percent_change(current_throughput.ops_per_sec, baseline_throughput.ops_per_sec);
-			let p95_delta = percent_change(current_latency.p95_ms, baseline_latency.p95_ms);
-			let p99_delta = percent_change(current_latency.p99_ms, baseline_latency.p99_ms);
+			let p95_delta =
+				steady_state_latency_delta(current_latency.p95_ms, baseline_latency.p95_ms);
+			let p99_delta =
+				steady_state_latency_delta(current_latency.p99_ms, baseline_latency.p99_ms);
 			output.push_str(&format!(
-				"- {row_name}: {} OPS {:.2} -> {} OPS {:.2} ({:+.2}%), {} p95 {:.2} -> {} p95 {:.2} ms ({:+.2}%), {} p99 {:.2} -> {} p99 {:.2} ms ({:+.2}%)\n",
+				"- {row_name}: {} OPS {:.2} -> {} OPS {:.2} ({:+.2}%), {} p95 {:.2} -> {} p95 {:.2} ms ({}), {} p99 {:.2} -> {} p99 {:.2} ms ({})\n",
 				database_label(&baseline.database),
 				baseline_throughput.ops_per_sec,
 				database_label(&current.database),
@@ -637,12 +653,12 @@ fn evaluate_steady_state(
 				baseline_latency.p95_ms,
 				database_label(&current.database),
 				current_latency.p95_ms,
-				p95_delta,
+				format_steady_state_latency_delta(p95_delta, baseline_latency.p95_ms),
 				database_label(&baseline.database),
 				baseline_latency.p99_ms,
 				database_label(&current.database),
 				current_latency.p99_ms,
-				p99_delta
+				format_steady_state_latency_delta(p99_delta, baseline_latency.p99_ms)
 			));
 			if ops_delta < -cfg.max_ops_regression_pct {
 				failures.push(format!(
@@ -650,15 +666,17 @@ fn evaluate_steady_state(
 					cfg.max_ops_regression_pct
 				));
 			}
-			if p95_delta > cfg.max_latency_regression_pct {
+			if p95_delta.is_some_and(|delta| delta > cfg.max_latency_regression_pct) {
 				failures.push(format!(
-					"{row_name} p95 regressed {p95_delta:.2}%, above {:.2}%",
+					"{row_name} p95 regressed {:.2}%, above {:.2}%",
+					p95_delta.unwrap_or_default(),
 					cfg.max_latency_regression_pct
 				));
 			}
-			if p99_delta > cfg.max_latency_regression_pct {
+			if p99_delta.is_some_and(|delta| delta > cfg.max_latency_regression_pct) {
 				failures.push(format!(
-					"{row_name} p99 regressed {p99_delta:.2}%, above {:.2}%",
+					"{row_name} p99 regressed {:.2}%, above {:.2}%",
+					p99_delta.unwrap_or_default(),
 					cfg.max_latency_regression_pct
 				));
 			}
@@ -772,6 +790,33 @@ fn validate_steady_state_row(
 			failures.push(format!("{source} {row_name} has invalid drain"));
 		}
 		return;
+	}
+	if row_name == "transaction_contention" {
+		let Some(validation) = &row.validation else {
+			failures.push(format!("{source} {row_name} is missing validation"));
+			return;
+		};
+		if validation.transaction_attempts == 0 {
+			failures.push(format!("{source} {row_name} completed zero transaction attempts"));
+		}
+		if validation.transaction_commits + validation.transaction_conflicts
+			!= validation.transaction_attempts
+		{
+			failures.push(format!("{source} {row_name} has inconsistent transaction counters"));
+		}
+		if validation.errors > 0 {
+			failures
+				.push(format!("{source} {row_name} has {} validation errors", validation.errors));
+		}
+		if validation.read_misses > 0 {
+			failures.push(format!(
+				"{source} {row_name} has {} transaction read misses",
+				validation.read_misses
+			));
+		}
+		if validation.observed_mix != "transaction=1" || validation.expected_mix_prefix.is_empty() {
+			failures.push(format!("{source} {row_name} has invalid transaction mix details"));
+		}
 	}
 	let Some(throughput) = &row.throughput else {
 		failures.push(format!("{source} {row_name} is missing throughput"));
@@ -970,7 +1015,7 @@ fn is_steady_state_row(row: &str) -> bool {
 				| "point_read_missing_in_range"
 				| "range_scan_uniform"
 				| "sustained_ingest"
-				| "idle"
+				| "idle" | "transaction_contention"
 		)
 }
 
@@ -1010,6 +1055,18 @@ fn percent_change(current: f64, baseline: f64) -> f64 {
 		return 0.0;
 	}
 	(current - baseline) * 100.0 / baseline
+}
+
+fn steady_state_latency_delta(current: f64, baseline: f64) -> Option<f64> {
+	(baseline > 0.0).then(|| percent_change(current, baseline))
+}
+
+fn format_steady_state_latency_delta(delta: Option<f64>, baseline: f64) -> String {
+	match delta {
+		Some(delta) => format!("{delta:+.2}%"),
+		None if baseline == 0.0 => "n/a (zero baseline)".to_string(),
+		None => "n/a (invalid baseline)".to_string(),
+	}
 }
 
 #[cfg(test)]
@@ -1191,7 +1248,12 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 	#[test]
 	fn rejects_steady_state_rows_in_legacy_gate() {
-		for row in ["balanced_zipfian", "read_heavy_zipfian", "update_heavy_zipfian"] {
+		for row in [
+			"balanced_zipfian",
+			"read_heavy_zipfian",
+			"update_heavy_zipfian",
+			"transaction_contention",
+		] {
 			let cfg = GateConfig {
 				rows: vec![row.into()],
 				ratio_rows: Vec::new(),
@@ -1205,6 +1267,24 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 			assert!(err.to_string().contains("steady-state row"));
 		}
+	}
+
+	#[test]
+	fn rejects_transaction_configuration_mismatch() {
+		let mut baseline = steady_state_row("transaction_contention", 1000.0, 2.0, 4.0);
+		let current = steady_state_row("transaction_contention", 1000.0, 2.0, 4.0);
+		baseline.task.transaction_hot_set = 64;
+		let mut failures = Vec::new();
+
+		validate_steady_state_comparable(
+			"transaction_contention",
+			&baseline,
+			&current,
+			true,
+			&mut failures,
+		);
+
+		assert!(failures.iter().any(|failure| failure.contains("task metadata differs")));
 	}
 
 	#[test]
@@ -1248,6 +1328,23 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 		assert!(eval.passed);
 		assert!(eval.report.contains("toykv OPS 1000.00 -> toykv OPS 980.00"));
 		assert!(eval.report.contains("Result: PASS"));
+	}
+
+	#[test]
+	fn steady_state_gate_skips_zero_latency_baseline_percentage() {
+		let cfg = steady_state_cfg(&["point_read_missing_in_range"]);
+		let baseline = steady_state_row("point_read_missing_in_range", 1000.0, 0.0, 0.0);
+		let current = steady_state_row("point_read_missing_in_range", 1000.0, 0.001, 0.001);
+		let inputs = SteadyStateGateInputs {
+			baseline: steady_state_rows(&[baseline]),
+			current: steady_state_rows(&[current]),
+		};
+
+		let eval = evaluate_steady_state(&cfg, &inputs).expect("gate evaluates");
+
+		assert!(eval.passed, "{}", eval.report);
+		assert!(eval.report.contains("n/a (zero baseline)"));
+		assert!(!eval.report.contains("inf%"));
 	}
 
 	#[test]
@@ -1795,6 +1892,10 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 				operation_mix_period: 1000,
 				key_selection: "scrambled_zipfian".into(),
 				zipfian_exponent: 0.99,
+				transaction_hot_set: 128,
+				transaction_reads: 5,
+				transaction_updates: 5,
+				transaction_retries: 0,
 			},
 			phases: completed_steady_state_phases(),
 			throughput: Some(SteadyStateThroughput {
@@ -1816,6 +1917,9 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 				scan_count_errors: 0,
 				observed_mix: "read=1.000000".into(),
 				expected_mix_prefix: "read=100".into(),
+				transaction_attempts: 0,
+				transaction_commits: 0,
+				transaction_conflicts: 0,
 			}),
 			drain: Some(SteadyStateDrain {
 				elapsed_ms: 1.0,
@@ -1846,6 +1950,10 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 				operation_mix_period: 1000,
 				key_selection: "uniform".into(),
 				zipfian_exponent: 0.99,
+				transaction_hot_set: 128,
+				transaction_reads: 5,
+				transaction_updates: 5,
+				transaction_retries: 0,
 			},
 			phases: completed_steady_state_phases(),
 			throughput: None,
