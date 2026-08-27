@@ -1,7 +1,7 @@
 #![cfg(feature = "rocksdb")]
 
 use crate::benchmark::NOT_SUPPORTED_ERROR;
-use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
+use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext, TransactionOutcome};
 use crate::keyprovider::{IntegerKeyProvider, KeyProvider, StringKeyProvider};
 use crate::memory::Config;
 use crate::value::BenchValue;
@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use log::error;
 use rocksdb::{
 	BlockBasedOptions, BottommostLevelCompaction, Cache, CompactOptions, DBCompactionStyle,
-	DBCompressionType, FlushOptions, IteratorMode, LogLevel, OptimisticTransactionDB,
+	DBCompressionType, ErrorKind, FlushOptions, IteratorMode, LogLevel, OptimisticTransactionDB,
 	OptimisticTransactionOptions, Options, ReadOptions, WaitForCompactOptions, WriteOptions,
 };
 use std::hint::black_box;
@@ -20,6 +20,10 @@ use std::time::Duration;
 
 const DATABASE_DIR: &str = "rocksdb";
 const STEADY_STATE_RESET_BATCH_SIZE: usize = 1_000;
+
+fn is_transaction_conflict(error: &rocksdb::Error) -> bool {
+	matches!(error.kind(), ErrorKind::Busy | ErrorKind::TryAgain | ErrorKind::Expired)
+}
 
 /// Calculate RocksDB specific memory allocation
 fn calculate_rocksdb_memory() -> u64 {
@@ -224,6 +228,52 @@ impl BenchmarkClient for RocksDBClient {
 			self.batch_delete_bytes(chunk.iter().cloned()).await?;
 		}
 		Ok(())
+	}
+
+	async fn transaction_u32(
+		&self,
+		read_keys: Vec<u32>,
+		updates: Vec<(u32, BenchValue)>,
+	) -> Result<TransactionOutcome> {
+		let update_count = u32::try_from(updates.len())?;
+		let mut transaction_options = OptimisticTransactionOptions::default();
+		transaction_options.set_snapshot(true);
+		let mut write_options = WriteOptions::default();
+		write_options.set_sync(self.sync);
+		let txn = self.db.transaction_opt(&write_options, &transaction_options);
+		let mut read_hits = 0;
+		let mut read_misses = 0;
+		{
+			let snapshot = txn.snapshot();
+			let mut read_options = ReadOptions::default();
+			read_options.set_snapshot(&snapshot);
+			read_options.set_verify_checksums(false);
+			read_options.set_async_io(true);
+			for key in read_keys {
+				match txn.get_pinned_opt(key.to_ne_bytes(), &read_options)? {
+					Some(bytes) => {
+						BenchValue::decode(bytes.as_ref())?;
+						read_hits += 1;
+					}
+					None => read_misses += 1,
+				}
+			}
+		}
+		for (key, value) in updates {
+			txn.put(key.to_ne_bytes(), value.encode()?)?;
+		}
+		match txn.commit() {
+			Ok(()) => Ok(TransactionOutcome::Committed {
+				read_hits,
+				read_misses,
+				updates: update_count,
+			}),
+			Err(error) if is_transaction_conflict(&error) => Ok(TransactionOutcome::Conflict {
+				read_hits,
+				read_misses,
+			}),
+			Err(error) => Err(error.into()),
+		}
 	}
 
 	async fn create_u32(&self, key: u32, val: BenchValue) -> Result<()> {

@@ -159,6 +159,10 @@ Options:
       --zipfian-exponent <ZIPFIAN_EXPONENT>    Steady-state Zipfian exponent
       --operation-mix <OPERATION_MIX>          Custom steady-state operation mix, for example `read=0.5,update=0.5`
       --operation-mix-period <N>               Custom operation mix period
+      --transaction-hot-set <N>                Number of keys used by transaction contention
+      --transaction-reads <N>                  Reads per transaction contention attempt
+      --transaction-updates <N>                Updates per transaction contention attempt
+      --transaction-retries <N>                Retries after an optimistic conflict
   -h, --help                                   Print help (see more with '--help')
   ```
 
@@ -173,6 +177,18 @@ steady-state rows are `balanced_zipfian`, `read_heavy_zipfian`,
 Omitting `--bench` runs all eight default steady-state rows.
 The optional `idle` row records phase and drain timing without client
 operations and is not included in the default OPS gate.
+The `transaction_contention` row is opt-in and reports transaction attempts,
+commits, and expected optimistic conflicts in JSON validation metrics.
+
+Example:
+
+```bash
+cargo run --release --features toykv --bin crud-bench -- \
+  --suite steady-state --database toykv --bench transaction_contention \
+  --samples 10000 --clients 4 --threads 1 --preset smoke \
+  --transaction-hot-set 128 --transaction-reads 5 --transaction-updates 5 \
+  --transaction-retries 2 --color never
+```
 
 For more detailed help information run the following command:
 

@@ -144,6 +144,12 @@ pub(crate) struct SteadyStateValidation {
 	pub(crate) scan_count_errors: u64,
 	pub(crate) observed_mix: String,
 	pub(crate) expected_mix_prefix: String,
+	#[serde(default)]
+	pub(crate) transaction_attempts: u64,
+	#[serde(default)]
+	pub(crate) transaction_commits: u64,
+	#[serde(default)]
+	pub(crate) transaction_conflicts: u64,
 }
 
 #[derive(Clone, Serialize)]

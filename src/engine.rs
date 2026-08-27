@@ -17,6 +17,20 @@ pub enum ScanContext {
 	WithIndex,
 }
 
+/// Result of one optimistic transaction attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransactionOutcome {
+	Committed {
+		read_hits: u32,
+		read_misses: u32,
+		updates: u32,
+	},
+	Conflict {
+		read_hits: u32,
+		read_misses: u32,
+	},
+}
+
 /// A trait for a database benchmark implementation
 /// setting up a database, and creating clients.
 pub(crate) trait BenchmarkEngine<C>: Sized
@@ -60,6 +74,18 @@ pub(crate) trait BenchmarkClient: Sync + Send + 'static {
 	/// Best-effort removal of steady-state benchmark keys in `[0, upper)`.
 	async fn reset_steady_state(&self, _upper: u32, _kp: &mut KeyProvider) -> Result<()> {
 		bail!(NOT_SUPPORTED_ERROR)
+	}
+
+	/// Execute one numeric-key optimistic transaction.
+	///
+	/// Backends classify retryable commit conflicts as [`TransactionOutcome::Conflict`]
+	/// and return other failures as errors.
+	fn transaction_u32(
+		&self,
+		_read_keys: Vec<u32>,
+		_updates: Vec<(u32, BenchValue)>,
+	) -> impl Future<Output = Result<TransactionOutcome>> + Send {
+		async move { bail!(NOT_SUPPORTED_ERROR) }
 	}
 
 	/// Create a single entry with the current client

@@ -4,8 +4,8 @@
 //! [`crate::result::OperationResult`] values for reporting.
 
 use crate::dialect::Dialect;
-use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext};
-use crate::keyprovider::KeyProvider;
+use crate::engine::{BenchmarkClient, BenchmarkEngine, ScanContext, TransactionOutcome};
+use crate::keyprovider::{IntegerKeyProvider, KeyProvider};
 use crate::result::{
 	BenchmarkMetadata, BenchmarkResult, OperationMetric, OperationResult, ScanResult, ScanRun,
 	ScanWorkload, SteadyStateDrain, SteadyStateLatency, SteadyStatePhase, SteadyStatePhases,
@@ -170,6 +170,10 @@ pub(crate) struct Benchmark {
 	pub(crate) zipfian_exponent: f64,
 	pub(crate) operation_mix: Option<String>,
 	pub(crate) operation_mix_period: u32,
+	pub(crate) transaction_hot_set: u32,
+	pub(crate) transaction_reads: u32,
+	pub(crate) transaction_updates: u32,
+	pub(crate) transaction_retries: u32,
 }
 
 impl Benchmark {
@@ -206,6 +210,10 @@ impl Benchmark {
 			zipfian_exponent: args.zipfian_exponent,
 			operation_mix: args.operation_mix.clone(),
 			operation_mix_period: args.operation_mix_period,
+			transaction_hot_set: args.transaction_hot_set,
+			transaction_reads: args.transaction_reads,
+			transaction_updates: args.transaction_updates,
+			transaction_retries: args.transaction_retries,
 		}
 	}
 
@@ -955,6 +963,9 @@ impl Benchmark {
 			scan_count_errors: measurement.scan_count_errors,
 			observed_mix,
 			expected_mix_prefix: workload.expected_mix_prefix(config, measurement.completed),
+			transaction_attempts: measurement.transaction_attempts,
+			transaction_commits: measurement.transaction_commits,
+			transaction_conflicts: measurement.transaction_conflicts,
 		});
 		let measurement_unsupported = measurement_failure.as_deref() == Some(NOT_SUPPORTED_ERROR);
 		let mut status = if measurement_unsupported {
@@ -1075,6 +1086,9 @@ impl Benchmark {
 				scan_count_errors: 0,
 				observed_mix: "none".to_string(),
 				expected_mix_prefix: "none".to_string(),
+				transaction_attempts: 0,
+				transaction_commits: 0,
+				transaction_conflicts: 0,
 			}),
 			drain: Some(SteadyStateDrain {
 				elapsed_ms: drain_elapsed.as_secs_f64() * 1000.0,
@@ -1149,9 +1163,16 @@ impl Benchmark {
 		let latency_samples = Arc::new(AtomicU64::new(0));
 		let errors = Arc::new(AtomicU64::new(0));
 		let scan_count_errors = Arc::new(AtomicU64::new(0));
+		let transaction_attempts = Arc::new(AtomicU64::new(0));
+		let transaction_commits = Arc::new(AtomicU64::new(0));
+		let transaction_conflicts = Arc::new(AtomicU64::new(0));
 		let failure_reason = Arc::new(Mutex::new(None::<String>));
 		let windows = Arc::new(Mutex::new(Vec::<u64>::new()));
 		let metric = record.then(|| OperationMetric::new(self.pid, 0));
+		let transaction_hot_set = self.transaction_hot_set;
+		let transaction_reads = self.transaction_reads;
+		let transaction_updates = self.transaction_updates;
+		let transaction_retries = self.transaction_retries;
 		let mut tasks = JoinSet::new();
 		for (client_index, client) in clients.iter().cloned().enumerate() {
 			for thread_index in 0..self.threads {
@@ -1168,6 +1189,9 @@ impl Benchmark {
 				let latency_samples = latency_samples.clone();
 				let errors = errors.clone();
 				let scan_count_errors = scan_count_errors.clone();
+				let transaction_attempts = transaction_attempts.clone();
+				let transaction_commits = transaction_commits.clone();
+				let transaction_conflicts = transaction_conflicts.clone();
 				let failure_reason = failure_reason.clone();
 				let windows = windows.clone();
 				let mut kp = kp;
@@ -1179,7 +1203,11 @@ impl Benchmark {
 					let mut histogram = Histogram::new(3)?;
 					while Instant::now() < deadline {
 						let op_index = sequence.fetch_add(1, Ordering::Relaxed);
-						let op = workload.operation_at(&config, op_index);
+						let op = if workload == SteadyStateWorkload::TransactionContention {
+							SteadyStateOperation::Read
+						} else {
+							workload.operation_at(&config, op_index)
+						};
 						let time = Instant::now();
 						let op_result = tokio::time::timeout(operation_timeout, async {
 							match op {
@@ -1196,7 +1224,85 @@ impl Benchmark {
 									Ok(())
 								}
 								SteadyStateOperation::Read => {
-									if workload.expects_missing_reads() {
+									if workload == SteadyStateWorkload::TransactionContention {
+										let hot_set =
+											transaction_hot_set.min(config.records).max(1);
+										let read_keys = (0..transaction_reads)
+											.map(|_| {
+												next_transaction_key(
+													&mut selector,
+													&mut kp,
+													hot_set,
+												)
+											})
+											.collect::<Result<Vec<_>>>()?;
+										let mut updates_for_txn =
+											Vec::with_capacity(transaction_updates as usize);
+										for _ in 0..transaction_updates {
+											updates_for_txn.push((
+												next_transaction_key(
+													&mut selector,
+													&mut kp,
+													hot_set,
+												)?,
+												vp.generate_value(),
+											));
+										}
+										let mut retries = 0;
+										loop {
+											transaction_attempts.fetch_add(1, Ordering::Relaxed);
+											match client
+												.transaction_u32(
+													read_keys.clone(),
+													updates_for_txn.clone(),
+												)
+												.await?
+											{
+												TransactionOutcome::Committed {
+													read_hits: hits,
+													read_misses: misses,
+													updates: written,
+												} => {
+													read_hits.fetch_add(
+														u64::from(hits),
+														Ordering::Relaxed,
+													);
+													read_misses.fetch_add(
+														u64::from(misses),
+														Ordering::Relaxed,
+													);
+													updates.fetch_add(
+														u64::from(written),
+														Ordering::Relaxed,
+													);
+													transaction_commits
+														.fetch_add(1, Ordering::Relaxed);
+													break;
+												}
+												TransactionOutcome::Conflict {
+													read_hits: hits,
+													read_misses: misses,
+												} => {
+													read_hits.fetch_add(
+														u64::from(hits),
+														Ordering::Relaxed,
+													);
+													read_misses.fetch_add(
+														u64::from(misses),
+														Ordering::Relaxed,
+													);
+													transaction_conflicts
+														.fetch_add(1, Ordering::Relaxed);
+													transaction_retry_or_fail(
+														retries,
+														transaction_retries,
+													)?;
+													retries += 1;
+												}
+											}
+										}
+										Ok(())
+									} else if workload.expects_missing_reads() {
 										let key = selector.next_missing_key()?;
 										match client.read(key, &mut kp).await {
 											Ok(_) => {
@@ -1310,6 +1416,9 @@ impl Benchmark {
 			failure_reason: failure_reason.lock().ok().and_then(|reason| reason.clone()),
 			per_second_windows: windows.lock().map(|w| w.clone()).unwrap_or_default(),
 			result,
+			transaction_attempts: transaction_attempts.load(Ordering::Relaxed),
+			transaction_commits: transaction_commits.load(Ordering::Relaxed),
+			transaction_conflicts: transaction_conflicts.load(Ordering::Relaxed),
 		})
 	}
 
@@ -1812,6 +1921,7 @@ enum SteadyStateWorkload {
 	RangeScanUniform,
 	SustainedIngest,
 	Idle,
+	TransactionContention,
 }
 
 impl SteadyStateWorkload {
@@ -1826,6 +1936,7 @@ impl SteadyStateWorkload {
 			Self::RangeScanUniform => "range_scan_uniform",
 			Self::SustainedIngest => "sustained_ingest",
 			Self::Idle => "idle",
+			Self::TransactionContention => "transaction_contention",
 		}
 	}
 
@@ -1840,12 +1951,13 @@ impl SteadyStateWorkload {
 			"range_scan_uniform" => Ok(Self::RangeScanUniform),
 			"sustained_ingest" => Ok(Self::SustainedIngest),
 			"idle" => Ok(Self::Idle),
+			"transaction_contention" => Ok(Self::TransactionContention),
 			other => bail!("unsupported steady-state workload `{other}`"),
 		}
 	}
 
 	fn requires_prepared_dataset(self) -> bool {
-		!matches!(self, Self::SustainedIngest)
+		!matches!(self, Self::SustainedIngest | Self::Idle)
 	}
 
 	fn operation_at(self, config: &SteadyStateConfig, op_index: u64) -> SteadyStateOperation {
@@ -1886,6 +1998,9 @@ impl SteadyStateWorkload {
 			Self::RangeScanUniform => SteadyStateOperation::Scan,
 			Self::SustainedIngest => SteadyStateOperation::Create,
 			Self::Idle => unreachable!("idle workloads do not execute client operations"),
+			Self::TransactionContention => {
+				unreachable!("transaction workloads use the transaction path")
+			}
 		}
 	}
 
@@ -1903,6 +2018,7 @@ impl SteadyStateWorkload {
 			Self::RangeScanUniform => "scan=1.0".to_string(),
 			Self::SustainedIngest => "create=1.0".to_string(),
 			Self::Idle => "none".to_string(),
+			Self::TransactionContention => "transaction=1.0".to_string(),
 		}
 	}
 
@@ -1913,6 +2029,7 @@ impl SteadyStateWorkload {
 			Self::RangeScanUniform => "uniform_positional",
 			Self::SustainedIngest => "unique_sequential",
 			Self::Idle => "none",
+			Self::TransactionContention => "transaction_hot_set",
 			_ => "scrambled_zipfian",
 		}
 	}
@@ -1936,6 +2053,7 @@ impl SteadyStateWorkload {
 				schedule.iter().all(|op| matches!(op, SteadyStateOperation::Read))
 			}
 			Self::Idle => false,
+			Self::TransactionContention => false,
 		};
 		if !valid {
 			bail!(
@@ -1966,6 +2084,9 @@ impl SteadyStateWorkload {
 	fn expected_mix_prefix(self, config: &SteadyStateConfig, completed: u64) -> String {
 		if self == SteadyStateWorkload::Idle {
 			return "none".to_string();
+		}
+		if self == SteadyStateWorkload::TransactionContention {
+			return format!("transaction={completed}");
 		}
 		let mut counts = SteadyStateCounts::default();
 		let period = config
@@ -2085,10 +2206,16 @@ struct SteadyStateMeasurement {
 	failure_reason: Option<String>,
 	per_second_windows: Vec<u64>,
 	result: Option<OperationResult>,
+	transaction_attempts: u64,
+	transaction_commits: u64,
+	transaction_conflicts: u64,
 }
 
 impl SteadyStateMeasurement {
 	fn observed_mix(&self) -> String {
+		if self.transaction_attempts > 0 {
+			return "transaction=1".to_string();
+		}
 		SteadyStateCounts {
 			creates: self.creates,
 			reads: self.read_hits + self.read_misses,
@@ -2202,6 +2329,33 @@ impl KeySelector {
 	fn next_u64(&mut self) -> u64 {
 		self.rng = splitmix64(self.rng);
 		self.rng
+	}
+}
+
+fn next_transaction_key(
+	selector: &mut KeySelector,
+	kp: &mut KeyProvider,
+	upper: u32,
+) -> Result<u32> {
+	let logical_key = selector.uniform_u32(upper);
+	match kp {
+		KeyProvider::OrderedInteger(provider) => Ok(provider.key(logical_key)),
+		KeyProvider::UnorderedInteger(provider) => Ok(provider.key(logical_key)),
+		KeyProvider::OrderedString(_) | KeyProvider::UnorderedString(_) => {
+			bail!(NOT_SUPPORTED_ERROR)
+		}
+	}
+}
+
+fn transaction_retry_available(retries: u32, retry_limit: u32) -> bool {
+	retries < retry_limit
+}
+
+fn transaction_retry_or_fail(retries: u32, retry_limit: u32) -> Result<()> {
+	if transaction_retry_available(retries, retry_limit) {
+		Ok(())
+	} else {
+		bail!("steady-state transaction conflict retry limit exhausted")
 	}
 }
 
@@ -2358,6 +2512,9 @@ fn failed_steady_state_row(
 			scan_count_errors: 0,
 			observed_mix: String::new(),
 			expected_mix_prefix: workload.expected_mix_prefix(config, 0),
+			transaction_attempts: 0,
+			transaction_commits: 0,
+			transaction_conflicts: 0,
 		}),
 		drain: None,
 		operation_result: None,
@@ -2367,6 +2524,50 @@ fn failed_steady_state_row(
 #[cfg(test)]
 mod steady_state_tests {
 	use super::*;
+
+	#[test]
+	fn transaction_contention_uses_deterministic_provider_keys() -> Result<()> {
+		let config = SteadyStateConfig {
+			records: 32,
+			warmup: Duration::ZERO,
+			measurement: Duration::from_secs(1),
+			latency_sample_every: 1,
+			seed: 7,
+			zipfian_exponent: 0.99,
+			bench_spec: Some("transaction_contention".to_string()),
+			operation_mix: None,
+			operation_schedule: None,
+			operation_mix_period: 1000,
+		};
+		let mut first_selector =
+			KeySelector::new(&config, SteadyStateWorkload::TransactionContention, 0);
+		let mut second_selector =
+			KeySelector::new(&config, SteadyStateWorkload::TransactionContention, 0);
+		let mut first_keys = KeyProvider::new(crate::KeyType::Integer, false);
+		let mut second_keys = KeyProvider::new(crate::KeyType::Integer, false);
+		let first = (0..32)
+			.map(|_| next_transaction_key(&mut first_selector, &mut first_keys, 32))
+			.collect::<Result<Vec<_>>>()?;
+		let second = (0..32)
+			.map(|_| next_transaction_key(&mut second_selector, &mut second_keys, 32))
+			.collect::<Result<Vec<_>>>()?;
+		assert_eq!(first, second);
+		assert!(first.iter().all(|key| (1..=32).contains(key)));
+		Ok(())
+	}
+
+	#[test]
+	fn transaction_retry_limit_is_strict() {
+		assert!(transaction_retry_available(0, 1));
+		assert!(!transaction_retry_available(1, 1));
+		assert!(!transaction_retry_available(0, 0));
+	}
+
+	#[test]
+	fn transaction_retry_exhaustion_is_an_error() {
+		let error = transaction_retry_or_fail(1, 1).expect_err("retry exhaustion must fail");
+		assert_eq!(error.to_string(), "steady-state transaction conflict retry limit exhausted");
+	}
 
 	#[test]
 	fn operation_mix_requires_exact_period() {

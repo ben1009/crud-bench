@@ -90,15 +90,22 @@ Later rows:
 | Row | Operation mix | Purpose |
 |---|---:|---|
 | `idle` | no client operations | Background phase and drain timing |
-| `transaction_contention` | parameterized | Serializable transaction contention, only after the adapter API supports it |
+| `transaction_contention` | parameterized | Serializable transaction contention over a deterministic hot set |
 
 Backends that cannot support a row should report the row as skipped with a
 structured unsupported reason, not as a benchmark failure.
 
 The canonical operation names for steady-state rows are `create`, `read`,
-`update`, and `scan`. Adapter methods such as `read_*` and `update_*` map to
-those names directly. CLI `--operation-mix`, JSON `task.operation_mix`, and
-`validation.observed_mix` must use only canonical names.
+`update`, `scan`, and `transaction`. Adapter methods such as `read_*` and
+`update_*` map to those names directly. CLI `--operation-mix`, JSON
+`task.operation_mix`, and `validation.observed_mix` must use only canonical
+names.
+
+`transaction_contention` is a single logical operation. Each attempt reads
+`--transaction-reads` keys and updates `--transaction-updates` keys selected
+uniformly from `--transaction-hot-set`. Optimistic commit conflicts are
+expected outcomes, counted separately, and retried up to
+`--transaction-retries`; non-conflict errors remain validation failures.
 
 ## 6. Dataset Contract
 
@@ -267,7 +274,10 @@ Required JSON fields:
     "updates": 61728,
     "scan_count_errors": 0,
     "observed_mix": "read=0.500000,update=0.500000",
-    "expected_mix_prefix": "read=61728,update=61728"
+    "expected_mix_prefix": "read=61728,update=61728",
+    "transaction_attempts": 0,
+    "transaction_commits": 0,
+    "transaction_conflicts": 0
   },
   "drain": {
     "elapsed_ms": 25.0,
@@ -461,8 +471,9 @@ the accepted benchmark priority.
 1. Add `read_heavy_zipfian`. Done in this implementation.
 2. Add `update_heavy_zipfian`. Done in this implementation.
 3. Add `point_read_missing_in_range`. Done in this implementation.
-4. Add `transaction_contention` after the adapter API supports serializable
-   transaction configuration.
+4. `transaction_contention` is implemented in the CRUD harness, with
+   serializable adapter support, deterministic tests, and bounded
+   ToyKV/RocksDB smoke comparisons.
 
 ## 14. Open Questions
 
