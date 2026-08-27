@@ -178,6 +178,14 @@ struct SteadyStateTask {
 	operation_mix_period: u32,
 	key_selection: String,
 	zipfian_exponent: f64,
+	#[serde(default)]
+	transaction_hot_set: u32,
+	#[serde(default)]
+	transaction_reads: u32,
+	#[serde(default)]
+	transaction_updates: u32,
+	#[serde(default)]
+	transaction_retries: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1007,7 +1015,7 @@ fn is_steady_state_row(row: &str) -> bool {
 				| "point_read_missing_in_range"
 				| "range_scan_uniform"
 				| "sustained_ingest"
-				| "idle"
+				| "idle" | "transaction_contention"
 		)
 }
 
@@ -1240,7 +1248,12 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 	#[test]
 	fn rejects_steady_state_rows_in_legacy_gate() {
-		for row in ["balanced_zipfian", "read_heavy_zipfian", "update_heavy_zipfian"] {
+		for row in [
+			"balanced_zipfian",
+			"read_heavy_zipfian",
+			"update_heavy_zipfian",
+			"transaction_contention",
+		] {
 			let cfg = GateConfig {
 				rows: vec![row.into()],
 				ratio_rows: Vec::new(),
@@ -1254,6 +1267,24 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 
 			assert!(err.to_string().contains("steady-state row"));
 		}
+	}
+
+	#[test]
+	fn rejects_transaction_configuration_mismatch() {
+		let mut baseline = steady_state_row("transaction_contention", 1000.0, 2.0, 4.0);
+		let current = steady_state_row("transaction_contention", 1000.0, 2.0, 4.0);
+		baseline.task.transaction_hot_set = 64;
+		let mut failures = Vec::new();
+
+		validate_steady_state_comparable(
+			"transaction_contention",
+			&baseline,
+			&current,
+			true,
+			&mut failures,
+		);
+
+		assert!(failures.iter().any(|failure| failure.contains("task metadata differs")));
 	}
 
 	#[test]
@@ -1861,6 +1892,10 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 				operation_mix_period: 1000,
 				key_selection: "scrambled_zipfian".into(),
 				zipfian_exponent: 0.99,
+				transaction_hot_set: 128,
+				transaction_reads: 5,
+				transaction_updates: 5,
+				transaction_retries: 0,
 			},
 			phases: completed_steady_state_phases(),
 			throughput: Some(SteadyStateThroughput {
@@ -1915,6 +1950,10 @@ Test,Total time,Mean,Max,99th,95th,75th,50th,25th,1st,Min,IQR,OPS,CPU_avg,CPU_mi
 				operation_mix_period: 1000,
 				key_selection: "uniform".into(),
 				zipfian_exponent: 0.99,
+				transaction_hot_set: 128,
+				transaction_reads: 5,
+				transaction_updates: 5,
+				transaction_retries: 0,
 			},
 			phases: completed_steady_state_phases(),
 			throughput: None,

@@ -103,6 +103,10 @@ pub(crate) struct SteadyStateTask {
 	pub(crate) operation_mix_period: u32,
 	pub(crate) key_selection: &'static str,
 	pub(crate) zipfian_exponent: f64,
+	pub(crate) transaction_hot_set: u32,
+	pub(crate) transaction_reads: u32,
+	pub(crate) transaction_updates: u32,
+	pub(crate) transaction_retries: u32,
 }
 
 #[derive(Clone, Serialize)]

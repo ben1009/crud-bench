@@ -2078,6 +2078,10 @@ impl SteadyStateWorkload {
 			operation_mix_period: config.operation_mix_period,
 			key_selection: self.key_selection(),
 			zipfian_exponent: config.zipfian_exponent,
+			transaction_hot_set: benchmark.transaction_hot_set,
+			transaction_reads: benchmark.transaction_reads,
+			transaction_updates: benchmark.transaction_updates,
+			transaction_retries: benchmark.transaction_retries,
 		}
 	}
 
