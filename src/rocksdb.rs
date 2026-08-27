@@ -250,7 +250,7 @@ impl BenchmarkClient for RocksDBClient {
 			read_options.set_verify_checksums(false);
 			read_options.set_async_io(true);
 			for key in read_keys {
-				match txn.get_pinned_opt(key.to_ne_bytes(), &read_options)? {
+				match txn.get_pinned_for_update_opt(key.to_ne_bytes(), true, &read_options)? {
 					Some(bytes) => {
 						BenchValue::decode(bytes.as_ref())?;
 						read_hits += 1;
